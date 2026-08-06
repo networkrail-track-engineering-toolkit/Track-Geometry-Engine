@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CDDS CSV Export</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; min-height: 100vh; padding: 30px; }
+  h1 { font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase; color: #666; margin-bottom: 20px; border-bottom: 1px solid #1e1e1e; padding-bottom: 10px; }
+  label { font-size: 9px; color: #555; letter-spacing: 0.1em; text-transform: uppercase; display: block; margin-bottom: 3px; }
+  input, select { width: 100%; background: #141414; border: 1px solid #2a2a2a; color: #e0e0e0; padding: 6px 8px; font-family: 'Courier New', monospace; font-size: 11px; margin-bottom: 10px; outline: none; }
+  input:focus { border-color: #444; }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; }
+  button { width: 100%; background: #e0e0e0; color: #0d0d0d; border: none; padding: 10px; font-family: 'Courier New', monospace; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; margin-top: 4px; }
+  button:hover { background: #fff; }
+  button:disabled { background: #2a2a2a; color: #555; cursor: not-allowed; }
+  #status { margin-top: 14px; font-size: 11px; min-height: 16px; color: #666; }
+  #status.ok  { color: #4caf50; }
+  #status.err { color: #f44336; }
+  #progress { margin-top: 6px; font-size: 10px; color: #555; min-height: 14px; }
+  .note { font-size: 9px; color: #444; margin-top: 16px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>CDDS CSV Export — via localhost:3000</h1>
+
+<label>ELR</label>
+<input id="elr" value="ECM1">
+
+<label>Track ID</label>
+<input id="tid" value="1100">
+
+<label>Start (miles / yards)</label>
+<div class="row">
+  <input id="sm" type="number" value="146" placeholder="Mile">
+  <input id="sy" type="number" value="0" placeholder="Yards">
+</div>
+
+<label>End (miles / yards)</label>
+<div class="row">
+  <input id="em" type="number" value="148" placeholder="Mile">
+  <input id="ey" type="number" value="0" placeholder="Yards">
+</div>
+
+<label>Date (find available)</label>
+<div class="row" style="gap:8px;margin-bottom:10px">
+  <button type="button" onclick="findDates()" id="datesBtn" style="margin:0;padding:6px;font-size:9px">Find Dates</button>
+  <select id="dateSelect" style="margin:0;flex:2"><option value="">— find dates first —</option></select>
+</div>
+
+<button id="exportBtn" onclick="doExport()" disabled>Export CSV</button>
+
+<div id="status"></div>
+<div id="progress"></div>
+
+<div class="note">
+  This page calls your local Express server at localhost:3000.<br>
+  Make sure <code>npm run dev</code> is running before using.
+</div>
+
+<script>
+  function yards(m, y) { return parseInt(m)*1760 + parseInt(y||0); }
+
+  async function findDates() {
+    const btn = document.getElementById('datesBtn');
+    btn.disabled = true; btn.textContent = 'Finding...';
+    const sy = yards(document.getElementById('sm').value, document.getElementById('sy').value);
+    const ey = yards(document.getElementById('em').value, document.getElementById('ey').value);
+    const elr = document.getElementById('elr').value.trim().toUpperCase();
+    const tid = document.getElementById('tid').value.trim();
+    try {
+      const r = await fetch(`/api/cdds/dates?elr=${elr}&tid=${tid}&sy=${sy}&ey=${ey}`);
+      const d = await r.json();
+      const sel = document.getElementById('dateSelect');
+      sel.innerHTML = '';
+      (d.dates || []).forEach(dt => {
+        const opt = document.createElement('option');
+        opt.value = dt; opt.textContent = dt;
+        sel.appendChild(opt);
+      });
+      if (d.dates && d.dates.length > 0) {
+        document.getElementById('exportBtn').disabled = false;
+        document.getElementById('status').className = 'ok';
+        document.getElementById('status').textContent = `Found ${d.dates.length} survey date(s)`;
+      } else {
+        document.getElementById('status').className = 'err';
+        document.getElementById('status').textContent = 'No dates found for this section';
+      }
+    } catch(e) {
+      document.getElementById('status').className = 'err';
+      document.getElementById('status').textContent = 'Error: ' + e.message + ' — is npm run dev running?';
+    }
+    btn.disabled = false; btn.textContent = 'Find Dates';
+  }
+
+  async function doExport() {
+    const btn = document.getElementById('exportBtn');
+    const status = document.getElementById('status');
+    const progress = document.getElementById('progress');
+    btn.disabled = true; btn.textContent = 'Fetching from CDDS...';
+    status.className = ''; status.textContent = 'Requesting data...';
+    progress.textContent = 'This may take 30-60 seconds for large sections...';
+
+    const elr  = document.getElementById('elr').value.trim().toUpperCase();
+    const tid  = document.getElementById('tid').value.trim();
+    const sy   = yards(document.getElementById('sm').value, document.getElementById('sy').value);
+    const ey   = yards(document.getElementById('em').value, document.getElementById('ey').value);
+    const date = document.getElementById('dateSelect').value;
+
+    try {
+      const r = await fetch(`/api/cdds/export?elr=${elr}&tid=${tid}&sy=${sy}&ey=${ey}&date=${encodeURIComponent(date)}`);
+      if (!r.ok) {
+        const err = await r.json();
+        throw new Error(err.error || r.status);
+      }
+      const blob = await r.blob();
+      const text = await blob.text();
+      const lines = text.split('\n').length;
+
+      // Trigger download
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+      const d = date.replace(/\//g,'-').split(' ')[0];
+      a.download = `CDDS_${elr}_${tid}_${d}.csv`;
+      a.click();
+
+      status.className = 'ok';
+      status.textContent = `Downloaded — ${lines} lines, ${(blob.size/1024).toFixed(1)} KB`;
+      progress.textContent = '';
+    } catch(e) {
+      status.className = 'err';
+      status.textContent = 'Error: ' + e.message;
+      progress.textContent = '';
+    }
+    btn.disabled = false; btn.textContent = 'Export CSV';
+  }
+</script>
+</body>
+</html>

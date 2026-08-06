@@ -1,0 +1,1950 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Track Geometry Engine</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #E4E3E0; color: #141414; font-family: sans-serif; margin: 0; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .animate-spin { animation: spin 1s linear infinite; }
+    .channel-container { overflow: hidden; position: relative; }
+    .trace-scroll { overflow-x: scroll; overflow-y: hidden; cursor: grab; user-select: none; }
+    .trace-scroll:active { cursor: grabbing; }
+    .trace-scroll::-webkit-scrollbar { height: 6px; }
+    .trace-scroll::-webkit-scrollbar-thumb { background: #141414; border-radius: 3px; }
+    .resize-handle {
+      height: 6px; background: transparent; cursor: ns-resize;
+      border-bottom: 1px solid rgba(20,20,20,0.2);
+      position: relative; z-index: 10;
+    }
+    .resize-handle:hover { background: rgba(20,20,20,0.1); }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+    // ─── Channel config ────────────────────────────────────────────────────────
+    const CHANNELS = [
+      { key: 'Twist3m',    label: 'Twist3m',    rawCol: 3,  unit: '5 mm/div',    defaultScale: 5,   divSize: 5,  defaultZoom: 15,  color: '#141414' },
+      { key: 'Ltop35m',    label: 'Ltop35m',    rawCol: 11, unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#141414' },
+      { key: 'Dip',        label: 'Dip',         rawCol: 16, unit: '10 mrad/div', defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#141414' },
+      { key: 'Rtop35m',    label: 'Rtop35m',    rawCol: 10, unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#141414' },
+      { key: 'Amean35m',   label: 'Amean35m',   rawCol: 5,  unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#0034FF' },
+      { key: 'Amean70m',   label: 'Amean70m',   rawCol: 6,  unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#0034FF' },
+      { key: 'Mtop70m',    label: 'Mtop70m',    rawCol: 7,  unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#141414' },
+      { key: 'Gauge',      label: 'Gauge',       rawCol: 9,  unit: '10 mm/div',   defaultScale: 10,  divSize: 10, defaultZoom: 30,  color: '#141414' },
+      { key: 'Crosslevel', label: 'Crosslevel',  rawCol: 8,  unit: '50 mm/div',   defaultScale: 50,  divSize: 50, defaultZoom: 150, color: '#0034FF' },
+      { key: 'Curv',       label: 'Curv',        rawCol: 15, unit: '50 mm/div',   defaultScale: 50,  divSize: 50, defaultZoom: 150, color: '#0034FF' },
+      { key: 'CantDef',    label: 'Cant Def',    rawCol: 14, unit: '50 mm/div',   defaultScale: 50,  divSize: 50, defaultZoom: 150, color: '#0034FF' },
+    ];
+
+    // Annotation-only channels (no raw data, just overlays)
+    const ANNOTATION_CHANNELS = [
+      { key: 'sc',         label: 'S&C',       color: '#009900', height: 50 },
+      { key: 'otm',        label: 'OTM Plan',  color: '#1a6b3c', height: 50 },
+      { key: 'structures', label: 'Structures', color: '#8800cc', height: 50 },
+      { key: 'trackcat',   label: 'Track Cat', color: '#E87722', height: 50 },
+    ];
+
+      // ──────────────────────────────────────────────────────────────────
+      // Fault limit tables (from NR/L2/TRK/001 Mod 11 Issue 12 Mar 2026)
+      // speedRange: [min, max] in mph — inclusive
+      // limit: mm (absolute ± from centre for Twist/Top/Line, offset from 1435mm baseline for Gauge)
+      // ──────────────────────────────────────────────────────────────────
+      const FAULT_LIMITS = {
+        twist: {
+          channels: ['Twist3m'],
+          groups: [
+            { id: 'ial_block',  label: 'IAL — Block line', kind: 'IAL', symmetric: true,
+              action: 'Block the line, correct before opening',
+              rules: [{ speedRange: [0, 999], limit: 33 }] },
+            { id: 'ial',        label: 'IAL',              kind: 'IAL', symmetric: true,
+              action: 'Correct within 36 hours',
+              rules: [
+                { speedRange: [5, 75],   limit: 24 },
+                { speedRange: [80, 125], limit: 21 }
+              ] },
+            { id: 'al',         label: 'AL',               kind: 'AL',  symmetric: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [0, 999], limit: 12 }] }
+          ]
+        },
+        tightGauge: {
+          channels: ['Gauge'],
+          groups: [
+            { id: 'al_hi',    label: 'AL (105-125mph)',   kind: 'AL', symmetric: false, side: 'tight',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [105, 125], limit: 1430 }] },
+            { id: 'al_lo',    label: 'AL (5-100mph)',     kind: 'AL', symmetric: false, side: 'tight',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [5, 100], limit: 1426 }] },
+            { id: 'al_mean_hi', label: 'AL Mean 110yd (105-125)', kind: 'AL', symmetric: false, side: 'tight', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [105, 125], limit: 1431 }] },
+            { id: 'al_mean_md', label: 'AL Mean 110yd (55-100)', kind: 'AL', symmetric: false, side: 'tight', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [55, 100], limit: 1429 }] },
+            { id: 'al_mean_lo', label: 'AL Mean 110yd (5-50)',  kind: 'AL', symmetric: false, side: 'tight', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [5, 50], limit: 1427 }] }
+          ]
+        },
+        wideGauge: {
+          channels: ['Gauge'],
+          groups: [
+            { id: 'ial_block_hi', label: 'IAL Block (105-125)', kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Block the line, correct before opening',
+              rules: [{ speedRange: [105, 125], limit: 1472 }] },
+            { id: 'ial_block_lo', label: 'IAL Block (5-100)',  kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Block the line, correct before opening',
+              rules: [{ speedRange: [5, 100], limit: 1478 }] },
+            { id: 'ial_hi',       label: 'IAL (105-125)',       kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Correct within 36 hours',
+              rules: [{ speedRange: [105, 125], limit: 1463 }] },
+            { id: 'ial_lo',       label: 'IAL (5-100)',         kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Correct within 36 hours',
+              rules: [{ speedRange: [5, 100], limit: 1470 }] },
+            { id: 'ial_static_hi',label: 'IAL Static (>25mph)', kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Correct within 36 hours',
+              rules: [{ speedRange: [26, 125], limit: 1458 }] },
+            { id: 'ial_static_lo',label: 'IAL Static (5-25)',   kind: 'IAL', symmetric: false, side: 'wide',
+              action: 'Correct within 36 hours',
+              rules: [{ speedRange: [5, 25], limit: 1460 }] },
+            { id: 'al_hi',        label: 'AL (105-125)',        kind: 'AL',  symmetric: false, side: 'wide',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [105, 125], limit: 1450 }] },
+            { id: 'al_md',        label: 'AL (30-100)',         kind: 'AL',  symmetric: false, side: 'wide',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [30, 100], limit: 1450 }] },
+            { id: 'al_lo',        label: 'AL (5-25)',           kind: 'AL',  symmetric: false, side: 'wide',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [5, 25], limit: 1455 }] },
+            { id: 'al_static',    label: 'AL Static',           kind: 'AL',  symmetric: false, side: 'wide',
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [0, 999], limit: 1445 }] },
+            { id: 'al_mean_hi',   label: 'AL Mean 110yd (80-125)', kind: 'AL', symmetric: false, side: 'wide', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [80, 125], limit: 1453 }] },
+            { id: 'al_mean_md',   label: 'AL Mean 110yd (55-75)',  kind: 'AL', symmetric: false, side: 'wide', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [55, 75], limit: 1460 }] },
+            { id: 'al_mean_lo',   label: 'AL Mean 110yd (5-50)',   kind: 'AL', symmetric: false, side: 'wide', mean: true,
+              action: 'No prescribed timescale',
+              rules: [{ speedRange: [5, 50], limit: 1463 }] }
+          ]
+        },
+        top: {
+          channels: ['Ltop35m', 'Rtop35m'],
+          groups: [
+            { id: 'al', label: 'AL', kind: 'AL', symmetric: true,
+              action: 'No prescribed timescale',
+              rules: [
+                { speedRange: [105, 125], limit: 14 },
+                { speedRange: [80, 100],  limit: 16 },
+                { speedRange: [55, 75],   limit: 18 },
+                { speedRange: [30, 50],   limit: 20 },
+                { speedRange: [0, 25],    limit: 23 }
+              ] }
+          ]
+        },
+        line: {
+          channels: ['Amean35m'],
+          groups: [
+            { id: 'al', label: 'AL', kind: 'AL', symmetric: true,
+              action: 'No prescribed timescale',
+              rules: [
+                { speedRange: [105, 125], limit: 9 },
+                { speedRange: [80, 100],  limit: 11 },
+                { speedRange: [55, 75],   limit: 13 },
+                { speedRange: [30, 50],   limit: 17 },
+                { speedRange: [0, 25],    limit: 21 }
+              ] }
+          ]
+        }
+      };
+
+      // Lookup limit at a given speed for a given group
+      const limitAtSpeed = (group, speed) => {
+        if (speed === null || speed === undefined) return null;
+        for (const rule of group.rules) {
+          if (speed >= rule.speedRange[0] && speed <= rule.speedRange[1]) return rule.limit;
+        }
+        return null;
+      };
+
+    const LABEL_WIDTH = 90; // px left margin for channel labels
+
+    // Maps fault parameter names from CSV to channel keys
+    const FAULT_PARAM_TO_CHANNEL = {
+      // Faults CSV parameter names (from Current_Faults export)
+      'Twist 3m':              'Twist3m',
+      'Left Top 35m':          'Ltop35m',
+      'Right Top 35m':         'Rtop35m',
+      'Left Top / WT35':       'Ltop35m',
+      'Right Top / WT35':      'Rtop35m',
+      'Dip Angle':             'Dip',
+      'Alignment 35m':         'Amean35m',
+      'Alignment 70m':         'Amean70m',
+      'Alignment 35m / AL35':  'Amean35m',
+      'Alignment 70m / AL70':  'Amean70m',
+      'Top 70m':               'Mtop70m',
+      'MT70':                  'Mtop70m',
+      'Mean Gauge':            'Gauge',
+      'Crosslevel':            'Crosslevel',
+      'Curvature':             'Curv',
+      'Cant Deficiency':       'CantDef',
+      'Cant Def':              'CantDef',
+      // Quality CSV parameter names (from Track_Quality export)
+      'Twist3m':               'Twist3m',
+      'WT35':                  'Ltop35m',
+      'AL35':                  'Amean35m',
+      'AL70':                  'Amean70m',
+      'MT70':                  'Mtop70m',
+      'Gauge':                 'Gauge',
+      'CantDef':               'CantDef',
+      'Dip':                   'Dip',
+      'Amean35m':              'Amean35m',
+      'Amean70m':              'Amean70m',
+      'Mtop70m':               'Mtop70m',
+      'Curv':                  'Curv',
+    };
+
+    const FAULT_COLORS = {
+      'Super Red': 'rgba(0,220,220,0.35)',
+      'Very Poor': 'rgba(255,0,0,0.25)',
+      'Poor':      'rgba(0,34,255,0.2)',
+      'Reportable':'rgba(255,0,200,0.25)',
+      'CYC':       'rgba(255,143,0,0.3)',
+    };
+    const FAULT_BORDER_COLORS = {
+      'Super Red': 'rgba(0,200,200,0.9)',
+      'Very Poor': 'rgba(220,0,0,0.9)',
+      'Poor':      'rgba(0,34,255,0.8)',
+      'Reportable':'rgba(220,0,180,0.9)',
+      'CYC':       'rgba(220,120,0,0.9)',
+    };
+
+    function parseFaultsCSV(text) {
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 3) return [];
+      // Line 0 is metadata (date + track selection), line 1 is headers, line 2+ is data
+      const headerLine = lines[1];
+      const headers = headerLine.split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const rows = [];
+      for (let i = 2; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const cols = line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+        const row = {};
+        headers.forEach((h, idx) => { row[h] = cols[idx] || ''; });
+        rows.push(row);
+      }
+      return rows;
+    }
+    const PIXELS_PER_YARD_BASE = 0.15; // base zoom
+    const MIN_CHANNEL_HEIGHT = 30;
+    const DEFAULT_CHANNEL_HEIGHT = 80;
+
+    // ─── Parse raw CSV ─────────────────────────────────────────────────────────
+    function parseRawCSV(text) {
+      const lines = text.split(/\r?\n/);
+      const header = lines[0];
+      const meta = {};
+      const elrM = header.match(/ELR:\s*(\S+)/); if (elrM) meta.elr = elrM[1];
+      const tidM = header.match(/Track Id:\s*(\d+)/); if (tidM) meta.trackId = tidM[1];
+      const dateM = header.match(/Date\(DD\/MM\/YYYY\):\s*(\S+)/); if (dateM) meta.date = dateM[1];
+      const startM = header.match(/Start Eighth:\s*(\S+)/); if (startM) meta.startEighth = startM[1];
+      const endM = header.match(/End Eighth:\s*(\S+)/); if (endM) meta.endEighth = endM[1];
+
+      const dataLines = lines.slice(4).filter(l => l.trim());
+      const points = [];
+      for (const line of dataLines) {
+        const cols = line.split('\t');
+        if (cols.length < 16) continue;
+        const mile = parseFloat(cols[0]);
+        const yards = parseFloat(cols[1]);
+        if (isNaN(mile) || isNaN(yards)) continue;
+        const values = {};
+        for (const ch of CHANNELS) {
+          const v = parseFloat(cols[ch.rawCol]);
+          values[ch.key] = isNaN(v) ? null : v;
+        }
+        // absolute yards from start of ELR for X positioning
+        const absYards = mile * 1760 + yards;
+        points.push({ mile, yards, absYards, values });
+      }
+      return { meta, points };
+    }
+
+    // ─── Format mileage ────────────────────────────────────────────────────────
+    function formatMileage(absYards) {
+      const mile = Math.floor(absYards / 1760);
+      const yds = Math.round(absYards % 1760);
+      return `${mile}m ${yds}y`;
+    }
+
+    // ─── Channel Canvas ────────────────────────────────────────────────────────
+    // Each canvas draws only the visible viewport, using scrollLeft to offset.
+    // Scale changes affect how many px = 1 unit, so threshold lines move accordingly.
+    // ChannelCanvas — viewport approach.
+    // Canvas is fixed to viewWidth, positioned sticky, redraws on scroll/zoom.
+    function ChannelCanvas({ channel, points, height, pixelsPerYard, scrollLeft, viewWidth, scale, divSize, faults, savgolData, savgolShowRaw, activeLimits, trackCat, onLimitHover }) {
+      const canvasRef = useRef(null);
+      const { useLayoutEffect } = React;
+
+      useLayoutEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || points.length === 0) return;
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+
+        canvas.width  = viewWidth * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width  = viewWidth + 'px';
+        canvas.style.height = height + 'px';
+        ctx.scale(dpr, dpr);
+
+        const minAbs    = points[0].absYards;
+        const midY      = height / 2;
+
+        // ── Y axis / zoom design ─────────────────────────────────
+        // div      = fixed mm value per division (e.g. 5mm for Twist3m). Never changes.
+        // zoomLevel (passed as `scale`) = number of divisions visible per half-channel.
+        //            default = 3 → shows ±3 divs. zoomLevel=6 → shows ±6 divs (zoomed out).
+        // pxPerDiv = how many pixels one division occupies = (height/2) / zoomLevel
+        //            this SHRINKS as zoomLevel increases, keeping divisions proportional.
+        // pxPerUnit = pxPerDiv / div — pixels per 1mm of data
+
+        const div       = divSize || 5;           // fixed mm per division (never changes)
+        // scale = mm visible in half the channel (e.g. 15 for Twist3m shows ±15mm)
+        // pxPerUnit = pixels per 1mm — shrinks as scale increases (more range = smaller signal)
+        const pxPerUnit = (height / 2) / scale;    // pixels per 1mm
+        const pxPerDiv  = pxPerUnit * div;          // pixels per one division
+
+        // Visible abs range
+        const visStartAbs = minAbs + scrollLeft / pixelsPerYard;
+        const visEndAbs   = visStartAbs + viewWidth / pixelsPerYard;
+
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, viewWidth, height);
+
+        // Division lines — one line per div, spanning the full visible data range
+        // pxPerDiv never changes per div value, only more lines appear when zoomed out
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 0.5;
+        // Draw a line at every multiple of div within the visible range
+        const maxV = scale * 1.1; // slightly beyond edge so lines reach channel border
+        for (let v = div; v <= maxV; v += div) {
+          for (const sign of [1, -1]) {
+            const y = midY - sign * v * pxPerUnit;
+            if (y < -1 || y > height + 1) continue;
+            ctx.strokeStyle = (Math.round(v / div) % 2 === 0)
+              ? 'rgba(20,20,20,0.15)'
+              : 'rgba(20,20,20,0.08)';
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(viewWidth, y); ctx.stroke();
+          }
+        }
+        ctx.setLineDash([]);
+
+        // Zero line
+        ctx.strokeStyle = 'rgba(20,20,20,0.2)';
+        ctx.lineWidth = 0.7;
+        ctx.beginPath(); ctx.moveTo(0, midY); ctx.lineTo(viewWidth, midY); ctx.stroke();
+
+        // Visible points only
+        const visPoints = points.filter(p =>
+          p.absYards >= visStartAbs - 20 && p.absYards <= visEndAbs + 20
+        );
+
+        if (visPoints.length >= 2) {
+          // Only draw raw trace if no savgol filter active, or showRaw is on
+          if (!savgolData || savgolShowRaw !== false) {
+            ctx.strokeStyle = savgolData ? 'rgba(180,180,180,0.6)' : channel.color;
+            ctx.lineWidth = savgolData ? 0.7 : 1;
+            ctx.beginPath();
+            let started = false;
+            for (const p of visPoints) {
+              const v = p.values[channel.key];
+              if (v === null) { started = false; continue; }
+              const x  = (p.absYards - visStartAbs) * pixelsPerYard;
+              const y  = midY - v * pxPerUnit;
+              const cy = Math.max(-5, Math.min(height + 5, y));
+              if (!started) { ctx.moveTo(x, cy); started = true; }
+              else ctx.lineTo(x, cy);
+            }
+            ctx.stroke();
+          }
+
+          // Savgol filtered overlay — orange line on top of raw trace
+          if (savgolData && savgolData.length === points.length) {
+            ctx.strokeStyle = 'rgba(255, 100, 0, 0.9)';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            let fStarted = false;
+            for (let i = 0; i < points.length; i++) {
+              const p = points[i];
+              if (p.absYards < visStartAbs - 20 || p.absYards > visEndAbs + 20) { fStarted = false; continue; }
+              const fv = savgolData[i];
+              if (fv === null || fv === undefined) { fStarted = false; continue; }
+              const x  = (p.absYards - visStartAbs) * pixelsPerYard;
+              const y  = midY - fv * pxPerUnit;
+              const cy = Math.max(-5, Math.min(height + 5, y));
+              if (!fStarted) { ctx.moveTo(x, cy); fStarted = true; }
+              else ctx.lineTo(x, cy);
+            }
+            ctx.stroke();
+          }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Draw fault limit lines (speed-aware, segmented by track cat zones)
+        // ──────────────────────────────────────────────────────────
+        if (activeLimits && activeLimits.length > 0 && trackCat && trackCat.length > 0) {
+          activeLimits.forEach(lim => {
+            // Build segments where speed is constant — the limit value steps as speed changes
+            trackCat.forEach(tc => {
+              const segStartAbs = tc.startMiles * 1760 + tc.startYards;
+              const segEndAbs   = tc.endMiles   * 1760 + tc.endYards;
+              // Skip if segment entirely outside viewport
+              if (segEndAbs < visStartAbs || segStartAbs > visEndAbs) return;
+              const limitVal = limitAtSpeed(lim.group, tc.speed);
+              if (limitVal === null) return;
+
+              // For gauge, limit is absolute mm — convert to offset from 1435
+              const offsetVal = (lim.faultKey === 'tightGauge' || lim.faultKey === 'wideGauge')
+                ? (limitVal - 1435) : limitVal;
+
+              const color = lim.group.kind === 'IAL' ? 'rgba(255,51,51,0.55)' : 'rgba(255,153,0,0.55)';
+              ctx.strokeStyle = color;
+              ctx.lineWidth = 1.2;
+              ctx.setLineDash([4, 2]);
+
+              const x1 = Math.max(0, (segStartAbs - visStartAbs) * pixelsPerYard);
+              const x2 = Math.min(viewWidth, (segEndAbs - visStartAbs) * pixelsPerYard);
+              if (x2 <= x1) return;
+
+              // Symmetric → two lines (+ and -), Asymmetric (gauge) → one line on correct side
+              if (lim.group.symmetric) {
+                for (const sign of [1, -1]) {
+                  const y = midY - sign * offsetVal * pxPerUnit;
+                  if (y < -1 || y > height + 1) continue;
+                  ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke();
+                }
+              } else {
+                const y = midY - offsetVal * pxPerUnit;
+                if (y >= -1 && y <= height + 1) {
+                  ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2, y); ctx.stroke();
+                }
+              }
+            });
+          });
+          ctx.setLineDash([]);
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Highlight trace values that exceed any IAL limit (red overlay)
+        // ──────────────────────────────────────────────────────────
+        if (activeLimits && activeLimits.length > 0 && trackCat && trackCat.length > 0 && visPoints.length >= 2) {
+          // Build a quick per-point IAL threshold for this channel
+          const ialLimits = activeLimits.filter(l => l.group.kind === 'IAL');
+          if (ialLimits.length > 0) {
+            // Find speed at absYards
+            const speedAt = (abs) => {
+              for (const tc of trackCat) {
+                const s = tc.startMiles * 1760 + tc.startYards;
+                const e = tc.endMiles   * 1760 + tc.endYards;
+                if (abs >= s && abs <= e) return tc.speed;
+              }
+              return null;
+            };
+            ctx.strokeStyle = '#ff0000';
+            ctx.lineWidth = 1.8;
+            ctx.beginPath();
+            let redStarted = false;
+            for (let i = 0; i < visPoints.length; i++) {
+              const p = visPoints[i];
+              const v = p.values[channel.key];
+              if (v === null) { redStarted = false; continue; }
+              const sp = speedAt(p.absYards);
+              if (sp === null) { redStarted = false; continue; }
+              // Check exceedance of any active IAL
+              let exceeded = false;
+              for (const lim of ialLimits) {
+                const lv = limitAtSpeed(lim.group, sp);
+                if (lv === null) continue;
+                const thresh = (lim.faultKey === 'tightGauge' || lim.faultKey === 'wideGauge') ? (lv - 1435) : lv;
+                if (lim.group.symmetric) {
+                  if (Math.abs(v) >= thresh) { exceeded = true; break; }
+                } else if (lim.group.side === 'wide') {
+                  if (v >= thresh) { exceeded = true; break; }
+                } else if (lim.group.side === 'tight') {
+                  if (v <= thresh) { exceeded = true; break; }
+                }
+              }
+              if (exceeded) {
+                const x  = (p.absYards - visStartAbs) * pixelsPerYard;
+                const y  = midY - v * pxPerUnit;
+                const cy = Math.max(-5, Math.min(height + 5, y));
+                if (!redStarted) { ctx.moveTo(x, cy); redStarted = true; }
+                else ctx.lineTo(x, cy);
+              } else {
+                redStarted = false;
+              }
+            }
+            ctx.stroke();
+          }
+        }
+
+        // Draw fault boxes for this channel
+        if (faults && faults.length > 0) {
+          const channelKey = channel.key;
+          let drawnCount = 0;
+          faults.forEach(f => {
+            const mappedCh = FAULT_PARAM_TO_CHANNEL[f['Parameter']] || FAULT_PARAM_TO_CHANNEL[f['Fault Parameter']];
+            if (mappedCh !== channelKey) return;
+            const sm = parseInt(f['Start Miles'] || f['Start Mile'] || 0);
+            const sy = parseFloat(f['Start Yards'] || 0);
+            // Quality CSV has no End Miles column — end is same mile as start
+            const em = parseInt(f['End Miles'] || f['End Mile'] || sm);
+            const ey = parseFloat(f['End Yards'] || sy);
+            const startAbs = sm * 1760 + sy;
+            const endAbs   = em * 1760 + ey;
+            const x1 = (startAbs - visStartAbs) * pixelsPerYard;
+            const x2 = (endAbs   - visStartAbs) * pixelsPerYard;
+            if (x2 < 0 || x1 > viewWidth) return;
+            const isCyc = (f['Parameter'] || '').toLowerCase().includes('cyc');
+            // Quality CSV uses Quality Band text; Faults CSV has numeric Fault Size
+            const qualityBand = (f['Quality Band'] || '').toLowerCase();
+            const colorKey = isCyc ? 'CYC'
+              : qualityBand.includes('super') ? 'Super Red'
+              : qualityBand.includes('very')  ? 'Very Poor'
+              : qualityBand.includes('poor')  ? 'Poor'
+              : 'Reportable'; // current faults are always Reportable
+            ctx.fillStyle = FAULT_COLORS[colorKey] || 'rgba(255,0,0,0.2)';
+            ctx.strokeStyle = FAULT_BORDER_COLORS[colorKey] || 'rgba(255,0,0,0.8)';
+            ctx.lineWidth = 1;
+            const bx = Math.max(0, x1);
+            // Point faults (start==end) get a minimum width so they're visible
+            const minW = Math.max(6, 20 * pixelsPerYard);
+            const rawBw = Math.min(viewWidth, x2) - bx;
+            const bw = rawBw < 1 ? minW : rawBw;
+            const drawBx = rawBw < 1 ? Math.max(0, x1 - minW / 2) : bx;
+            if (drawBx < viewWidth && drawBx + bw > 0) {
+              ctx.fillRect(drawBx, 0, bw, height);
+              ctx.strokeRect(drawBx, 0, bw, height);
+              drawnCount++;
+            }
+          });
+          if (drawnCount > 0) console.log(channelKey + ': drew ' + drawnCount + ' fault boxes');
+        }
+
+        ctx.strokeStyle = 'rgba(20,20,20,0.2)';
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(0, 0, viewWidth, height);
+
+      }, [points, height, pixelsPerYard, scrollLeft, viewWidth, scale, channel, faults, savgolData, savgolShowRaw, activeLimits, trackCat]);
+
+      return <canvas ref={canvasRef} style={{ display: 'block' }} />;
+    }
+
+    // ─── Mileage ruler ────────────────────────────────────────────────────────
+    function MileageRuler({ points, pixelsPerYard, scrollLeft, viewWidth }) {
+      const canvasRef = useRef(null);
+      const height = 32;
+      const { useLayoutEffect: useRulerLayout } = React;
+
+      useRulerLayout(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || points.length === 0) return;
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width  = viewWidth * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width  = viewWidth + 'px';
+        canvas.style.height = height + 'px';
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+
+        ctx.fillStyle = '#E4E3E0';
+        ctx.fillRect(0, 0, viewWidth, height);
+
+        const minAbs      = points[0].absYards;
+        const maxAbs      = points[points.length - 1].absYards;
+        const visStartAbs = minAbs + scrollLeft / pixelsPerYard;
+        const visEndAbs   = visStartAbs + viewWidth / pixelsPerYard;
+        const yardsPerTick = 220;
+
+        ctx.fillStyle = '#141414';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+        ctx.strokeStyle = 'rgba(20,20,20,0.3)';
+        ctx.lineWidth = 0.5;
+
+        const startTick = Math.ceil(visStartAbs / yardsPerTick) * yardsPerTick;
+        for (let abs = startTick; abs <= visEndAbs; abs += yardsPerTick) {
+          const x = (abs - visStartAbs) * pixelsPerYard;
+          ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 8); ctx.stroke();
+          ctx.fillText(formatMileage(abs), x, 20);
+        }
+
+        ctx.strokeStyle = 'rgba(20,20,20,0.3)';
+        ctx.strokeRect(0, 0, viewWidth, height);
+
+      }, [points, pixelsPerYard, scrollLeft, viewWidth]);
+
+      return <canvas ref={canvasRef} style={{ display: 'block' }} />;
+    }
+
+    // ─── Savitzky-Golay Filter ────────────────────────────────────────────────
+    function savgolFilter(data, windowSize, polyOrder) {
+      const half = Math.floor(windowSize / 2);
+      const n = data.length;
+      const result = new Array(n);
+      // Precompute Vandermonde-based SG coefficients for window
+      // For simplicity use a polynomial least-squares convolution
+      // polyOrder=3, we compute coefficients once and convolve
+      function getCoeffs(w) {
+        const h = Math.floor(w / 2);
+        const pts = [];
+        for (let i = -h; i <= h; i++) pts.push(i);
+        const m = pts.length;
+        // Build Vandermonde matrix up to polyOrder
+        const A = pts.map(x => {
+          const row = [];
+          for (let p = 0; p <= polyOrder; p++) row.push(Math.pow(x, p));
+          return row;
+        });
+        // Compute (A^T A)^-1 A^T — first row gives smoothing coefficients
+        // For poly=3 window=w use the known closed-form: just weighted average
+        // Use simple numerical approach: solve normal equations
+        const p1 = polyOrder + 1;
+        // AtA matrix
+        const AtA = [];
+        for (let i = 0; i < p1; i++) {
+          AtA.push([]);
+          for (let j = 0; j < p1; j++) {
+            let s = 0;
+            for (let k = 0; k < m; k++) s += A[k][i] * A[k][j];
+            AtA[i].push(s);
+          }
+        }
+        // AtA inverse (Gauss-Jordan)
+        const inv = AtA.map((r, i) => [...r, ...Array(p1).fill(0).map((_,j) => i===j?1:0)]);
+        for (let col = 0; col < p1; col++) {
+          let maxRow = col;
+          for (let r = col+1; r < p1; r++) if (Math.abs(inv[r][col]) > Math.abs(inv[maxRow][col])) maxRow = r;
+          [inv[col], inv[maxRow]] = [inv[maxRow], inv[col]];
+          const pivot = inv[col][col];
+          for (let j = 0; j < 2*p1; j++) inv[col][j] /= pivot;
+          for (let r = 0; r < p1; r++) {
+            if (r === col) continue;
+            const f = inv[r][col];
+            for (let j = 0; j < 2*p1; j++) inv[r][j] -= f * inv[col][j];
+          }
+        }
+        const AtAinv = inv.map(r => r.slice(p1));
+        // Coefficients = first row of (A^T A)^-1 A^T
+        const coeffs = pts.map((_, k) => {
+          let c = 0;
+          for (let j = 0; j < p1; j++) c += AtAinv[0][j] * A[k][j];
+          return c;
+        });
+        return coeffs;
+      }
+      const coeffs = getCoeffs(windowSize);
+      for (let i = 0; i < n; i++) {
+        if (data[i] === null) { result[i] = null; continue; }
+        let sum = 0, wsum = 0;
+        for (let j = 0; j < coeffs.length; j++) {
+          const idx = i - half + j;
+          if (idx >= 0 && idx < n && data[idx] !== null) {
+            sum += coeffs[j] * data[idx];
+            wsum += Math.abs(coeffs[j]);
+          }
+        }
+        result[i] = wsum > 0 ? sum : data[i];
+      }
+      return result;
+    }
+
+    // ─── Hover Tooltip ─────────────────────────────────────────────────────────
+    function HoverTooltip({ info }) {
+      if (!info) return null;
+      const isAnnotation = info.annotationAsset != null;
+      const val = !isAnnotation && info.values ? info.values[info.channelKey] : null;
+      return (
+        <div style={{
+          position: 'fixed', left: info.x + 16, top: info.y - 8,
+          background: 'rgba(20,20,20,0.92)', color: '#E4E3E0',
+          padding: '8px 10px', fontSize: 10, fontFamily: 'monospace',
+          pointerEvents: 'none', zIndex: 9999,
+          border: '1px solid rgba(255,255,255,0.15)',
+          maxWidth: 240,
+        }}>
+          <div style={{ opacity: 0.6, marginBottom: 3 }}>{info.mileage}</div>
+          {isAnnotation ? (
+            <div>
+              <div style={{ fontWeight: 'bold', marginBottom: 2 }}>{info.annotationAsset.name}</div>
+              {info.annotationAsset.type    && <div style={{ opacity: 0.7, fontSize: 9 }}>{info.annotationAsset.type}</div>}
+              {info.annotationAsset.extra1  && <div style={{ opacity: 0.7, fontSize: 9 }}>{info.annotationAsset.extra1}</div>}
+              {info.annotationAsset.extra2  && <div style={{ opacity: 0.7, fontSize: 9 }}>{info.annotationAsset.extra2}</div>}
+              {info.annotationAsset.mileage && <div style={{ opacity: 0.7, fontSize: 9 }}>{info.annotationAsset.mileage}</div>}
+            </div>
+          ) : (
+            <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+              <span style={{ opacity: 0.6 }}>{info.channelLabel}</span>
+              <span style={{ fontWeight: 'bold', fontSize: 13 }}>
+                {val !== null && val !== undefined ? val.toFixed(2) : '—'}
+              </span>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── Annotation Channel Canvas ─────────────────────────────────────────────
+    function AnnotationCanvas({ channelKey, assets, height, pixelsPerYard, scrollLeft, viewWidth, traceMinAbs, surveyDate, otmWeeks }) {
+      const canvasRef = useRef(null);
+
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || viewWidth <= 0) return;
+        const ctx = canvas.getContext('2d');
+
+        canvas.width  = viewWidth;
+        canvas.height = height;
+        canvas.style.width  = viewWidth + 'px';
+        canvas.style.height = height + 'px';
+
+        ctx.fillStyle = '#fafafa';
+        ctx.fillRect(0, 0, viewWidth, height);
+
+        if (!traceMinAbs && traceMinAbs !== 0) return;
+
+        const visStartAbs = traceMinAbs + scrollLeft / pixelsPerYard;
+        const visEndAbs   = visStartAbs + viewWidth / pixelsPerYard;
+
+        const absToX = (miles, yards) => (miles * 1760 + yards - visStartAbs) * pixelsPerYard;
+        const inRange = (miles, yards) => {
+          const a = miles * 1760 + yards;
+          return a >= visStartAbs - 200 && a <= visEndAbs + 200;
+        };
+
+        ctx.font = '8px monospace';
+
+        if (channelKey === 'sc') {
+          ctx.strokeStyle = '#009900';
+          ctx.lineWidth = 1.5;
+          (assets.sc || []).forEach(sc => {
+            if (!inRange(sc.startMiles, sc.startYards) && !inRange(sc.endMiles, sc.endYards)) return;
+            const x1 = absToX(sc.startMiles, sc.startYards);
+            const x2 = absToX(sc.endMiles, sc.endYards);
+            if (x1 > -20 && x1 < viewWidth + 20) {
+              ctx.beginPath(); ctx.moveTo(x1, 0); ctx.lineTo(x1, height); ctx.stroke();
+              ctx.fillStyle = '#009900';
+              ctx.fillText((sc.desc || sc.railwayId || '').substring(0, 16), Math.max(2, Math.min(x1 + 2, viewWidth - 100)), height - 4);
+            }
+            if (Math.abs(x2 - x1) > 3 && x2 > -20 && x2 < viewWidth + 20) {
+              ctx.beginPath(); ctx.moveTo(x2, 0); ctx.lineTo(x2, height); ctx.stroke();
+            }
+          });
+
+        } else if (channelKey === 'otm') {
+          let items = assets.otm || [];
+          if (surveyDate) {
+            const OTM_MS = otmWeeks * 7 * 24 * 60 * 60 * 1000;
+            items = items.filter(o => {
+              if (!o.date) return false;
+              const d = new Date(o.date);
+              return !isNaN(d.getTime()) && Math.abs(d.getTime() - surveyDate.getTime()) <= OTM_MS;
+            });
+          }
+          items.forEach(otm => {
+            const x1 = absToX(otm.startMiles, otm.startYards);
+            const x2 = absToX(otm.endMiles, otm.endYards);
+            const rawL = Math.min(x1, x2); const rawR = Math.max(x1, x2);
+            if (rawR < 0 || rawL > viewWidth) return;
+            const cbx = Math.max(0, rawL);
+            const cbw = Math.min(viewWidth, rawR) - cbx;
+            if (cbw <= 0) return;
+            const sl = (otm.status || '').toLowerCase();
+            const fill   = sl.includes('complet') ? 'rgba(46,139,87,0.3)' : sl.includes('plan') ? 'rgba(33,119,181,0.3)' : 'rgba(204,51,51,0.3)';
+            const border = sl.includes('complet') ? '#2e8b57' : sl.includes('plan') ? '#2177b5' : '#cc3333';
+            ctx.fillStyle = fill;
+            ctx.fillRect(cbx, 2, cbw, height - 4);
+            ctx.strokeStyle = border; ctx.lineWidth = 1;
+            ctx.strokeRect(cbx, 2, cbw, height - 4);
+            ctx.fillStyle = border; ctx.font = '7px monospace';
+            const lx = Math.max(cbx + 2, 2);
+            if (height > 40) {
+              ctx.fillText((otm.location || '').substring(0, 20), lx, 11);
+              ctx.fillText((otm.otm || '').substring(0, 14), lx, 21);
+              ctx.fillText((otm.date || '').substring(0, 10), lx, 31);
+              ctx.fillText(otm.startMiles + 'm ' + otm.startYards + 'y — ' + otm.endMiles + 'm ' + otm.endYards + 'y', lx, 41);
+            } else {
+              ctx.fillText((otm.location || '').substring(0, 16) + '  ' + (otm.date || '').substring(0, 10), lx, height / 2 + 3);
+            }
+          });
+
+        } else if (channelKey === 'structures') {
+          const typeAbbr = { 'Overbridge':'OB', 'Underbridge':'UB', 'Underline Culvert':'UC', 'Footbridge':'FB' };
+          (assets.structures || []).forEach(s => {
+            if (!inRange(s.startMiles, s.startYards)) return;
+            const x = absToX(s.startMiles, s.startYards);
+            if (x < -20 || x > viewWidth + 20) return;
+            const abbr = typeAbbr[s.assetType] || '??';
+            ctx.strokeStyle = '#8800cc';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 2]);
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#8800cc';
+            ctx.fillText((s.name || s.railwayId || '').substring(0, 16) + ' [' + abbr + ']', Math.min(x + 2, viewWidth - 90), height - 4);
+          });
+        } else if (channelKey === 'trackcat') {
+          const TC_COLOR = '#E87722';
+          (assets.trackCat || []).forEach(tc => {
+            const x1 = absToX(tc.startMiles, tc.startYards);
+            const x2 = absToX(tc.endMiles, tc.endYards);
+            const rawL = Math.min(x1, x2); const rawR = Math.max(x1, x2);
+            if (rawR < 0 || rawL > viewWidth) return;
+            const cbx = Math.max(0, rawL);
+            const cbw = Math.min(viewWidth, rawR) - cbx;
+            if (cbw <= 0) return;
+            ctx.fillStyle = 'rgba(232,119,34,0.15)';
+            ctx.fillRect(cbx, 2, cbw, height - 4);
+            ctx.strokeStyle = TC_COLOR; ctx.lineWidth = 1; ctx.setLineDash([]);
+            ctx.strokeRect(cbx, 2, cbw, height - 4);
+            ctx.fillStyle = TC_COLOR; ctx.font = '7px monospace';
+            const lx = Math.max(cbx + 2, 2);
+            const from = tc.startMiles + 'm ' + tc.startYards + 'y';
+            const to   = tc.endMiles   + 'm ' + tc.endYards   + 'y';
+            if (height > 35) {
+              ctx.fillText('STCAT ' + (tc.lastStcat ?? '?'), lx, 11);
+              ctx.fillText((tc.speed ?? '?') + ' mph', lx, 21);
+              ctx.fillText(from + ' — ' + to, lx, 31);
+            } else {
+              ctx.fillText('S' + (tc.lastStcat ?? '?') + '  ' + (tc.speed ?? '?') + 'mph  ' + from, lx, height / 2 + 3);
+            }
+          });
+        }
+
+        ctx.strokeStyle = 'rgba(20,20,20,0.15)';
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(0, 0, viewWidth, height);
+
+      }, [channelKey, assets, height, pixelsPerYard, scrollLeft, viewWidth, traceMinAbs, surveyDate, otmWeeks]);
+
+      return <canvas ref={canvasRef} style={{ display: 'block', width: viewWidth, height }} />;
+    }
+
+    // ─── Main App ──────────────────────────────────────────────────────────────
+    function App() {
+      const [rawFile, setRawFile]       = useState(null);
+      const [faultsFile, setFaultsFile] = useState(null);
+      const [qualityFile, setQualityFile] = useState(null);
+      const [faultsData, setFaultsData]   = useState([]);
+      const [qualityData, setQualityData] = useState([]);
+      const [assetsData, setAssetsData]   = useState({ sc: [], otm: [], structures: [] });
+      const [otmWeeks, setOtmWeeks]         = useState(10);
+      // Fault limit toggles — per-fault master + per-group sub-toggles
+      const [faultLimitToggles, setFaultLimitToggles] = useState(() => {
+        const obj = {};
+        Object.keys(FAULT_LIMITS).forEach(faultKey => {
+          obj[faultKey] = { master: false };
+          FAULT_LIMITS[faultKey].groups.forEach(g => { obj[faultKey][g.id] = false; });
+        });
+        return obj;
+      });
+      const [faultDropdownsOpen, setFaultDropdownsOpen] = useState({});
+
+      const toggleFaultMaster = (faultKey) => {
+        setFaultLimitToggles(prev => {
+          const nowOn = !prev[faultKey].master;
+          const next = { ...prev, [faultKey]: { ...prev[faultKey], master: nowOn } };
+          // Master ON turns all groups on, master OFF turns all groups off
+          FAULT_LIMITS[faultKey].groups.forEach(g => { next[faultKey][g.id] = nowOn; });
+          return next;
+        });
+      };
+      const toggleFaultGroup = (faultKey, groupId) => {
+        setFaultLimitToggles(prev => {
+          const next = { ...prev, [faultKey]: { ...prev[faultKey], [groupId]: !prev[faultKey][groupId] } };
+          // Master reflects whether any group is on
+          next[faultKey].master = FAULT_LIMITS[faultKey].groups.some(g => next[faultKey][g.id]);
+          return next;
+        });
+      };
+      const [traceData, setTraceData]   = useState(null);
+      const [status, setStatus]         = useState('idle');
+
+      // ── CDDS search state ───────────────────────────────────────
+      const [cddsOpen, setCddsOpen]         = useState(false);
+      const [cddsELR, setCddsELR]           = useState('');
+      const [cddsTID, setCddsTID]           = useState('');
+      const [cddsStartM, setCddsStartM]     = useState('');
+      const [cddsStartY, setCddsStartY]     = useState('0');
+      const [cddsEndM, setCddsEndM]         = useState('');
+      const [cddsEndY, setCddsEndY]         = useState('0');
+      const [cddsDate, setCddsDate]         = useState('');
+      const [cddsDates, setCddsDates]       = useState([]);
+      const [cddsFetching, setCddsFetching] = useState(false);
+      const [cddsError, setCddsError]       = useState('');
+
+      const cddsFetchDates = async () => {
+        if (!cddsELR || !cddsTID || cddsStartM === '' || cddsEndM === '') return;
+        const sy = parseInt(cddsStartM) * 1760 + parseInt(cddsStartY || 0);
+        const ey = parseInt(cddsEndM)   * 1760 + parseInt(cddsEndY   || 0);
+        setCddsError('');
+        try {
+          const r = await fetch('/api/cdds/dates?elr=' + cddsELR + '&tid=' + cddsTID + '&sy=' + sy + '&ey=' + ey);
+          const d = await r.json();
+          setCddsDates(d.dates || []);
+          if (d.dates && d.dates.length > 0) setCddsDate(d.dates[0]);
+          else setCddsError('No survey dates found for this section');
+        } catch(e) { setCddsError('Failed to fetch dates: ' + e.message); }
+      };
+
+      const [cddsLastCSV, setCddsLastCSV] = useState('');
+
+      const cddsFetchTrace = async () => {
+        if (!cddsELR || !cddsTID || !cddsDate) return;
+        setCddsFetching(true); setCddsError('');
+        const sy = parseInt(cddsStartM) * 1760 + parseInt(cddsStartY || 0);
+        const ey = parseInt(cddsEndM)   * 1760 + parseInt(cddsEndY   || 0);
+        try {
+          const r = await fetch('/api/cdds/data?elr=' + cddsELR + '&tid=' + cddsTID + '&sy=' + sy + '&ey=' + ey + '&date=' + encodeURIComponent(cddsDate));
+          if (!r.ok) throw new Error('Server error ' + r.status);
+          const text = await r.text();
+          setCddsLastCSV(text);
+          const file = new File([text], 'cdds_trace.csv', { type: 'text/plain' });
+          await handleRawLoad(file);
+          setCddsOpen(false);
+        } catch(e) { setCddsError('Failed to fetch trace: ' + e.message); }
+        finally { setCddsFetching(false); }
+      };
+      const [error, setError]           = useState(null);
+      const [filename, setFilename]     = useState('');
+
+      const [pixelsPerYard, setPixelsPerYard] = useState(PIXELS_PER_YARD_BASE);
+      const [hoverInfo, setHoverInfo] = useState(null); // { x, y, mileage, values }
+      const [scrollLeft, setScrollLeft] = useState(0);
+      const [channelVisibility, setChannelVisibility] = useState(
+        Object.fromEntries(CHANNELS.map(ch => [ch.key, true]))
+      );
+      const toggleChannelVisibility = (key) => setChannelVisibility(prev => ({ ...prev, [key]: !prev[key] }));
+
+      const [channelHeights, setChannelHeights] = useState(
+        Object.fromEntries(CHANNELS.map(ch => [ch.key, DEFAULT_CHANNEL_HEIGHT]))
+      );
+      // channelScales now stores zoom level = number of divisions per half-channel
+      // e.g. zoom=3 with divSize=5 shows ±15mm; zoom=6 shows ±30mm
+      const SAVGOL_CHANNELS = ['Crosslevel', 'Curv', 'CantDef'];
+      const [savgolEnabled, setSavgolEnabled] = useState(
+        Object.fromEntries(SAVGOL_CHANNELS.map(k => [k, false]))
+      );
+      const [savgolShowRaw, setSavgolShowRaw] = useState(
+        Object.fromEntries(['Crosslevel','Curv','CantDef'].map(k => [k, true]))
+      );
+      const [savgolWindow, setSavgolWindow] = useState(
+        Object.fromEntries(SAVGOL_CHANNELS.map(k => [k, 2501]))
+      );
+      const [channelScales, setChannelScales] = useState(
+        Object.fromEntries(CHANNELS.map(ch => [ch.key, ch.defaultZoom || ch.defaultScale * 3]))
+      );
+
+      const [toggles, setToggles] = useState({
+        faults: true, quality: true, sc: true, otm: true,
+        underbridges: true, overbridges: true, culverts: true, trackcat: true,
+      });
+      const toggleItem = (key) => setToggles(prev => ({ ...prev, [key]: !prev[key] }));
+
+      const containerRef = useRef(null);
+      const scrollRef = useRef(null);
+      const resizingRef  = useRef(null);
+      const [viewWidth, setViewWidth] = useState(800);
+
+      // Update viewWidth on resize
+      useEffect(() => {
+        const update = () => {
+          if (containerRef.current) {
+            setViewWidth(containerRef.current.clientWidth - LABEL_WIDTH);
+          }
+        };
+        update();
+        window.addEventListener('resize', update);
+        return () => window.removeEventListener('resize', update);
+      }, []);
+
+      // Load raw CSV into state
+      const handleRawLoad = async (file) => {
+        const text = await file.text();
+        const parsed = parseRawCSV(text);
+        setTraceData(parsed);
+        setStatus('loaded');
+        setScrollLeft(0);
+        // Fetch assets from server for this ELR/TrackID
+        if (parsed.meta && parsed.meta.elr) {
+          fetch('/api/assets?elr=' + parsed.meta.elr + '&trackId=' + (parsed.meta.trackId || ''))
+            .then(r => r.json())
+            .then(data => {
+              setAssetsData(data);
+              console.log('Assets loaded: SC=' + data.sc.length + ' OTM=' + data.otm.length + ' Structures=' + data.structures.length);
+            })
+            .catch(e => console.error('Assets fetch failed:', e));
+        }
+        // Re-filter any already-loaded faults against the new trace ELR/TrackID
+        if (faultsData.length > 0 && parsed.meta) {
+          const elr = parsed.meta.elr || '';
+          const tid = parsed.meta.trackId || '';
+          setFaultsData(prev => prev.filter(row =>
+            (!elr || (row['ELR'] || '').trim().toUpperCase() === elr.toUpperCase()) &&
+            (!tid  || (row['Track ID'] || '').toString().trim() === tid.toString().trim())
+          ));
+        }
+      };
+
+      const handleFileChange = (setter) => (e) => {
+        if (e.target.files?.[0]) setter(e.target.files[0]);
+      };
+
+      const handleRawChange = (e) => {
+        if (e.target.files?.[0]) {
+          setRawFile(e.target.files[0]);
+          handleRawLoad(e.target.files[0]);
+        }
+      };
+
+      // Zoom
+      const handleWheel = useCallback((e) => {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          const factor = e.deltaY > 0 ? 0.9 : 1.1;
+          setPixelsPerYard(p => Math.max(0.02, Math.min(5, p * factor)));
+        }
+      }, []);
+
+
+
+      // Scroll sync
+
+      // Hover tracking
+      const handleMouseMove = useCallback((e) => {
+        if (!traceData || traceData.points.length === 0) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const xInContainer = e.clientX - rect.left;
+        const xInTrace = xInContainer - LABEL_WIDTH + scrollLeft;
+        if (xInTrace < 0) { setHoverInfo(null); return; }
+
+        // Account for scroll position within the container
+        const scrollTop = e.currentTarget.scrollTop || 0;
+        const RULER_H = 32;
+        let yInChannels = (e.clientY - rect.top) + scrollTop - RULER_H;
+        let hoveredChannel = null;
+        // Only iterate visible channels
+        const visibleChannels = CHANNELS.filter(ch => channelVisibility[ch.key]);
+        for (const ch of visibleChannels) {
+          const h = channelHeights[ch.key] + 6;
+          if (yInChannels <= h) { hoveredChannel = ch; break; }
+          yInChannels -= h;
+        }
+        const minAbs = traceData.points[0].absYards;
+        const hoverAbs = minAbs + xInTrace / pixelsPerYard;
+        const hoverMile = Math.floor(hoverAbs / 1760);
+        const hoverYards = Math.round(hoverAbs % 1760);
+        const hoverMileage = hoverMile + 'm ' + hoverYards + 'y';
+
+        // Check if we're over an annotation channel
+        if (!hoveredChannel) {
+          // Check annotation channels
+          const visibleAnnotations = ANNOTATION_CHANNELS.filter(ach => {
+            if (ach.key === 'structures') return toggles.underbridges || toggles.overbridges || toggles.culverts;
+            if (ach.key === 'trackcat') return toggles.trackcat;
+            return toggles[ach.key];
+          });
+          let hoveredAnnotation = null;
+          for (const ach of visibleAnnotations) {
+            if (yInChannels <= ach.height + 4) { hoveredAnnotation = ach; break; }
+            yInChannels -= ach.height + 4;
+          }
+          if (!hoveredAnnotation) { setHoverInfo(null); return; }
+
+          // Find nearest asset in this annotation channel
+          let nearestAsset = null;
+          let minAssetDist = Infinity;
+          // For trackcat, find the section that contains the hover position
+          if (hoveredAnnotation.key === 'trackcat') {
+            const tcList = assetsData.trackCat || [];
+            const hovered = tcList.find(tc => {
+              const s = tc.startMiles * 1760 + tc.startYards;
+              const e2 = tc.endMiles * 1760 + tc.endYards;
+              return hoverAbs >= s && hoverAbs <= e2;
+            });
+            if (hovered) {
+              setHoverInfo({
+                x: e.clientX, y: e.clientY,
+                mileage: hoverMileage,
+                annotationAsset: {
+                  name:    'STCAT ' + (hovered.lastStcat ?? '?') + '  |  ' + (hovered.speed ?? '?') + ' mph',
+                  type:    hovered.startMiles + 'm ' + hovered.startYards + 'y — ' + hovered.endMiles + 'm ' + hovered.endYards + 'y',
+                  mileage: '',
+                },
+              });
+            } else { setHoverInfo(null); }
+            return;
+          }
+
+          const assetList = hoveredAnnotation.key === 'sc' ? (assetsData.sc || [])
+            : hoveredAnnotation.key === 'structures' ? (assetsData.structures || []).filter(s => {
+                const isUB = s.assetType === 'Underbridge';
+                const isOB = s.assetType === 'Overbridge' || s.assetType === 'Footbridge';
+                const isUC = s.assetType === 'Underline Culvert';
+                return (isUB && toggles.underbridges) || (isOB && toggles.overbridges) || (isUC && toggles.culverts);
+              })
+            : [];
+
+          for (const asset of assetList) {
+            const abs = asset.startMiles * 1760 + asset.startYards;
+            const d = Math.abs(abs - hoverAbs);
+            if (d < minAssetDist) { minAssetDist = d; nearestAsset = asset; }
+          }
+
+          if (!nearestAsset || minAssetDist > 500) { setHoverInfo(null); return; }
+
+          const assetMile  = nearestAsset.startMiles;
+          const assetYards = nearestAsset.startYards;
+          setHoverInfo({
+            x: e.clientX, y: e.clientY,
+            mileage: hoverMileage,
+            annotationAsset: {
+              name:    nearestAsset.desc || nearestAsset.name || nearestAsset.railwayId || '',
+              type:    nearestAsset.assetType || '',
+              mileage: assetMile + 'm ' + assetYards + 'y',
+            },
+          });
+          return;
+        }
+
+        let nearest = null;
+        let minDist = Infinity;
+        for (const p of traceData.points) {
+          const d = Math.abs(p.absYards - hoverAbs);
+          if (d < minDist) { minDist = d; nearest = p; }
+          if (p.absYards > hoverAbs + 50) break;
+        }
+        if (!nearest) { setHoverInfo(null); return; }
+
+        // Check if there's a fault or quality annotation at this position on this channel
+        const channelKey = hoveredChannel.key;
+        const FAULT_PARAM_MAP = {
+          'Twist 3m':'Twist3m','Left Top / WT35':'Ltop35m','Right Top / WT35':'Rtop35m',
+          'Dip Angle':'Dip','Alignment 35m / AL35':'Amean35m','Alignment 70m / AL70':'Amean70m',
+          'MT70':'Mtop70m','Mean Gauge':'Gauge','AL35':'Amean35m','AL70':'Amean70m',
+          'WT35':'Ltop35m','Amean35m':'Amean35m','Amean70m':'Amean70m','Mtop70m':'Mtop70m',
+          'Twist3m':'Twist3m','Gauge':'Gauge','Crosslevel':'Crosslevel','Curv':'Curv',
+          'CantDef':'CantDef','Cant Def':'CantDef',
+        };
+
+        // Look for matching fault within 50 yards
+        let matchedFault = null;
+        if (toggles.faults) {
+          for (const f of faultsData) {
+            const mapped = FAULT_PARAM_MAP[f['Parameter'] || ''];
+            if (mapped !== channelKey) continue;
+            const sm = parseInt(f['Start Miles'] || 0);
+            const sy = parseFloat(f['Start Yards'] || 0);
+            const em = parseInt(f['End Miles'] || sm);
+            const ey = parseFloat(f['End Yards'] || sy);
+            const fStart = sm * 1760 + sy;
+            const fEnd   = em * 1760 + ey;
+            const midAbs = (fStart + fEnd) / 2;
+            if (Math.abs(midAbs - hoverAbs) < Math.max(50, (fEnd - fStart) / 2 + 30)) {
+              matchedFault = f; break;
+            }
+          }
+        }
+
+        let matchedQuality = null;
+        if (!matchedFault && toggles.quality) {
+          for (const q of qualityData) {
+            const mapped = FAULT_PARAM_MAP[q['Parameter'] || ''];
+            if (mapped !== channelKey) continue;
+            const sm = parseInt(q['Start Miles'] || 0);
+            const sy = parseFloat(q['Start Yards'] || 0);
+            const ey = parseFloat(q['End Yards'] || sy);
+            const qStart = sm * 1760 + sy;
+            const qEnd   = sm * 1760 + ey;
+            const midAbs = (qStart + qEnd) / 2;
+            if (Math.abs(midAbs - hoverAbs) < Math.max(50, (qEnd - qStart) / 2 + 30)) {
+              matchedQuality = q; break;
+            }
+          }
+        }
+
+        if (matchedFault) {
+          const sm = parseInt(matchedFault['Start Miles'] || 0);
+          const sy = parseFloat(matchedFault['Start Yards'] || 0);
+          const em = parseInt(matchedFault['End Miles'] || sm);
+          const ey = parseFloat(matchedFault['End Yards'] || sy);
+          setHoverInfo({
+            x: e.clientX, y: e.clientY,
+            mileage: sm + 'm ' + Math.round(sy) + 'y — ' + em + 'm ' + Math.round(ey) + 'y',
+            annotationAsset: {
+              name:   matchedFault['Parameter'] || '',
+              type:   'Fault Size: ' + (matchedFault['Fault Size'] || '—'),
+              extra1: null,
+              extra2: null,
+              mileage: null,
+            },
+          });
+          return;
+        }
+
+        if (matchedQuality) {
+          const sm = parseInt(matchedQuality['Start Miles'] || 0);
+          const sy = parseFloat(matchedQuality['Start Yards'] || 0);
+          const ey = parseFloat(matchedQuality['End Yards'] || sy);
+          setHoverInfo({
+            x: e.clientX, y: e.clientY,
+            mileage: sm + 'm ' + Math.round(sy) + 'y — ' + sm + 'm ' + Math.round(ey) + 'y',
+            annotationAsset: {
+              name:   matchedQuality['Parameter'] || '',
+              type:   'Quality: ' + (matchedQuality['Quality Band'] || '—'),
+              extra1: 'SD: ' + (matchedQuality['SD'] || '—'),
+              extra2: null,
+              mileage: null,
+            },
+          });
+          return;
+        }
+
+        // ─── Check for fault limit line hover ────────────────────────────
+        // Get y position within the hovered channel
+        const visibleChs = CHANNELS.filter(ch => channelVisibility[ch.key]);
+        let yAccum = 0;
+        let channelYStart = 0;
+        for (const ch of visibleChs) {
+          if (ch.key === hoveredChannel.key) { channelYStart = yAccum; break; }
+          yAccum += channelHeights[ch.key] + 4;
+        }
+        const yInThisChannel = yInChannels - channelYStart;
+        const chHeight = channelHeights[hoveredChannel.key];
+        const chMidY   = chHeight / 2;
+        const chScale  = channelScales[hoveredChannel.key];
+        const pxPerUnit = (chHeight / 2) / chScale;
+
+        // Find current speed from track cat at this position
+        const speedAt = (abs) => {
+          for (const tc of (assetsData.trackCat || [])) {
+            const s = tc.startMiles * 1760 + tc.startYards;
+            const e = tc.endMiles * 1760 + tc.endYards;
+            if (abs >= s && abs <= e) return tc.speed;
+          }
+          return null;
+        };
+        const curSpeed = speedAt(hoverAbs);
+
+        // Check each active limit for this channel
+        const limitsForCh = activeLimitsForChannel(hoveredChannel.key);
+        let closestLimit = null;
+        let closestDist = 6; // px tolerance
+        for (const lim of limitsForCh) {
+          const lv = limitAtSpeed(lim.group, curSpeed);
+          if (lv === null) continue;
+          const offsetVal = (lim.faultKey === 'tightGauge' || lim.faultKey === 'wideGauge') ? (lv - 1435) : lv;
+          const candidates = lim.group.symmetric ? [offsetVal, -offsetVal] : [offsetVal];
+          for (const val of candidates) {
+            const y = chMidY - val * pxPerUnit;
+            const d = Math.abs(y - yInThisChannel);
+            if (d < closestDist) {
+              closestDist = d;
+              closestLimit = { lim, lv, val, side: val > 0 ? '+' : '-' };
+            }
+          }
+        }
+
+        if (closestLimit) {
+          const L = closestLimit.lim;
+          const faultName = L.faultKey === 'tightGauge' ? 'Tight Gauge'
+            : L.faultKey === 'wideGauge' ? 'Wide Gauge'
+            : L.faultKey === 'twist' ? 'Twist 3m'
+            : L.faultKey === 'top' ? 'Top'
+            : L.faultKey === 'line' ? 'Line' : L.faultKey;
+          setHoverInfo({
+            x: e.clientX, y: e.clientY,
+            mileage: nearest.mile + 'm ' + Math.round(nearest.yards) + 'y',
+            annotationAsset: {
+              name:  faultName + ' — ' + L.group.kind + ' Limit',
+              type:  L.group.label,
+              extra1: 'Limit: ' + (L.lim.faultKey === 'tightGauge' || L.lim.faultKey === 'wideGauge' ? closestLimit.lv + 'mm' : '±' + closestLimit.lv + 'mm') + '  (' + (curSpeed ?? '?') + ' mph)',
+              extra2: 'Action: ' + L.group.action,
+              mileage: null,
+            },
+          });
+          return;
+        }
+
+        setHoverInfo({
+          x: e.clientX,
+          y: e.clientY,
+          mileage: nearest.mile + 'm ' + Math.round(nearest.yards) + 'y',
+          values: nearest.values,
+          channelKey: hoveredChannel.key,
+          channelLabel: hoveredChannel.label,
+        });
+      }, [traceData, scrollLeft, pixelsPerYard, channelHeights, channelVisibility, channelScales, assetsData, toggles, faultsData, qualityData, faultLimitToggles]);
+
+      const handleMouseLeave = useCallback(() => setHoverInfo(null), []);
+
+      // Arrow-key horizontal scroll — hold-to-repeat via RAF loop
+      React.useEffect(() => {
+        const keysDown = { ArrowLeft: false, ArrowRight: false };
+        let rafId = null;
+
+        const tick = () => {
+          const el = scrollRef.current;
+          if (!el) { rafId = null; return; }
+          let dx = 0;
+          if (keysDown.ArrowLeft)  dx -= 50;
+          if (keysDown.ArrowRight) dx += 50;
+          if (dx !== 0) el.scrollLeft += dx;
+          if (keysDown.ArrowLeft || keysDown.ArrowRight) {
+            rafId = requestAnimationFrame(tick);
+          } else {
+            rafId = null;
+          }
+        };
+
+        const onKeyDown = (e) => {
+          if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+          // Don't interfere with typing in inputs/textareas
+          const tag = (e.target.tagName || '').toLowerCase();
+          if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+          e.preventDefault();
+          keysDown[e.key] = true;
+          if (rafId === null) rafId = requestAnimationFrame(tick);
+        };
+        const onKeyUp = (e) => {
+          if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') keysDown[e.key] = false;
+        };
+
+        window.addEventListener('keydown', onKeyDown);
+        window.addEventListener('keyup', onKeyUp);
+        return () => {
+          window.removeEventListener('keydown', onKeyDown);
+          window.removeEventListener('keyup', onKeyUp);
+          if (rafId !== null) cancelAnimationFrame(rafId);
+        };
+      }, []);
+
+      // Channel resize
+      const startResize = (key, e) => {
+        e.preventDefault();
+        const startY = e.clientY;
+        const startH = channelHeights[key];
+        const onMove = (ev) => {
+          const newH = Math.max(MIN_CHANNEL_HEIGHT, startH + ev.clientY - startY);
+          setChannelHeights(prev => ({ ...prev, [key]: newH }));
+        };
+        const onUp = () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+      };
+
+      // Scale change per channel
+      const handleScaleChange = (key, val) => {
+        const n = parseFloat(val);
+        if (!isNaN(n) && n > 0) setChannelScales(prev => ({ ...prev, [key]: n }));
+      };
+
+      // Compute savgol filtered data for applicable channels
+      const savgolDataMap = React.useMemo(() => {
+        if (!traceData) return {};
+        const map = {};
+        for (const key of SAVGOL_CHANNELS) {
+          if (!savgolEnabled[key]) { map[key] = null; continue; }
+          const w = Math.max(5, savgolWindow[key] % 2 === 0 ? savgolWindow[key] + 1 : savgolWindow[key]);
+          const raw = traceData.points.map(p => p.values[key]);
+          map[key] = savgolFilter(raw, w, 3);
+        }
+        return map;
+      }, [traceData, savgolEnabled, savgolWindow]);
+
+      // Build active fault limits per channel — used by ChannelCanvas to draw limit lines
+      const activeLimitsForChannel = (channelKey) => {
+        const out = [];
+        Object.keys(FAULT_LIMITS).forEach(faultKey => {
+          const faultDef = FAULT_LIMITS[faultKey];
+          if (!faultDef.channels.includes(channelKey)) return;
+          faultDef.groups.forEach(g => {
+            if (faultLimitToggles[faultKey][g.id]) {
+              out.push({ faultKey, group: g });
+            }
+          });
+        });
+        return out;
+      };
+
+      // rawTraceWidth drives the inner div (scrollbar range)
+      // viewWidth is what the canvas actually draws into
+      const rawTraceWidth = traceData && traceData.points.length > 1
+        ? (traceData.points[traceData.points.length - 1].absYards - traceData.points[0].absYards) * pixelsPerYard
+        : viewWidth;
+
+      // Process + download
+      const handleProcess = async () => {
+        if (!rawFile || !faultsFile || !qualityFile) return;
+        setStatus('processing');
+        setError(null);
+        const formData = new FormData();
+        formData.append('raw',     rawFile);
+        formData.append('faults',  faultsFile);
+        formData.append('quality', qualityFile);
+        formData.append('filename', filename || 'annotated_trace');
+        formData.append('showFaults',       toggles.faults       ? '1' : '0');
+        formData.append('showQuality',      toggles.quality      ? '1' : '0');
+        formData.append('showSC',           toggles.sc           ? '1' : '0');
+        formData.append('showOTM',          toggles.otm          ? '1' : '0');
+        formData.append('showUnderbridges', toggles.underbridges ? '1' : '0');
+        formData.append('showOverbridges',  toggles.overbridges  ? '1' : '0');
+        formData.append('showCulverts',     toggles.culverts     ? '1' : '0');
+        formData.append('channelScales', JSON.stringify(channelScales));
+        try {
+          const res = await fetch('/api/process', { method: 'POST', body: formData });
+          if (!res.ok) { const d = await res.json(); throw new Error(d.error || 'Failed'); }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `${filename || 'annotated_trace'}.pdf`; a.click();
+          setStatus('loaded');
+        } catch (err) {
+          setError(err.message);
+          setStatus('loaded');
+        }
+      };
+
+      const totalHeight = CHANNELS.reduce((s, ch) => s + channelHeights[ch.key] + 6, 0);
+      const meta = traceData?.meta;
+
+      return (
+        <div style={{ minHeight: '100vh', background: '#E4E3E0' }}>
+          <header style={{ borderBottom: '1px solid #141414', padding: '16px 24px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M12 12h.01M7 12h.01M17 12h.01M5 18v2M19 18v2"/></svg>
+              <div>
+                <div style={{ fontWeight: 'bold', letterSpacing: '0.1em', textTransform: 'uppercase', fontSize: 15 }}>Track Geometry Engine</div>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', opacity: 0.5, textTransform: 'uppercase', letterSpacing: '0.15em' }}>Automated Processing Unit v2.0</div>
+              </div>
+            </div>
+            {meta && (
+              <div style={{ fontSize: 10, fontFamily: 'monospace', opacity: 0.7, textAlign: 'right' }}>
+                <div>{meta.elr} · Track {meta.trackId} · {meta.date}</div>
+                <div>{meta.startEighth} → {meta.endEighth} · {traceData.points.length.toLocaleString()} points</div>
+              </div>
+            )}
+          </header>
+
+          <div style={{ display: 'flex', gap: 0 }}>
+            <div style={{ width: 220, padding: 16, borderRight: '1px solid rgba(20,20,20,0.15)', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {cddsOpen && (
+                <div style={{ border: '1px solid rgba(20,20,20,0.3)', padding: 10, background: 'rgba(0,50,100,0.04)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5 }}>CDDS Search</div>
+                    <button onClick={() => setCddsOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 12, opacity: 0.4 }}>✕</button>
+                  </div>
+                  <div style={{ marginBottom: 5 }}>
+                    <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5, marginBottom: 2 }}>ELR</div>
+                    <input value={cddsELR} onChange={e => setCddsELR(e.target.value.toUpperCase())} placeholder="e.g. ECM1"
+                      style={{ width: '100%', boxSizing: 'border-box', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                  </div>
+                  <div style={{ marginBottom: 5 }}>
+                    <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5, marginBottom: 2 }}>Track ID</div>
+                    <input value={cddsTID} onChange={e => setCddsTID(e.target.value)} placeholder="e.g. 1100"
+                      style={{ width: '100%', boxSizing: 'border-box', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                  </div>
+                  <div style={{ marginBottom: 5 }}>
+                    <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5, marginBottom: 2 }}>Start (miles / yards)</div>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <input value={cddsStartM} onChange={e => setCddsStartM(e.target.value)} placeholder="Mile" type="number" min="0"
+                        style={{ width: '50%', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                      <input value={cddsStartY} onChange={e => setCddsStartY(e.target.value)} placeholder="Yards" type="number" min="0" max="1759"
+                        style={{ width: '50%', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                    </div>
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5, marginBottom: 2 }}>End (miles / yards)</div>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <input value={cddsEndM} onChange={e => setCddsEndM(e.target.value)} placeholder="Mile" type="number" min="0"
+                        style={{ width: '50%', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                      <input value={cddsEndY} onChange={e => setCddsEndY(e.target.value)} placeholder="Yards" type="number" min="0" max="1759"
+                        style={{ width: '50%', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '2px 5px', fontSize: 9, fontFamily: 'monospace' }} />
+                    </div>
+                  </div>
+                  <button onClick={cddsFetchDates}
+                    style={{ width: '100%', padding: '4px 0', fontSize: 9, fontFamily: 'monospace', cursor: 'pointer', background: 'rgba(20,20,20,0.08)', border: '1px solid rgba(20,20,20,0.2)', marginBottom: 6 }}>
+                    Find Available Dates
+                  </button>
+                  {cddsDates.length > 0 && (
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5, marginBottom: 2 }}>Survey Date</div>
+                      <select value={cddsDate} onChange={e => setCddsDate(e.target.value)}
+                        style={{ width: '100%', border: '1px solid rgba(20,20,20,0.3)', background: '#E4E3E0', padding: '2px 4px', fontSize: 9, fontFamily: 'monospace' }}>
+                        {cddsDates.map(d => {
+                          const m = d.match(/(\d{4})-(\d{2})-(\d{2})/);
+                          const label = m ? m[3]+'/'+m[2]+'/'+m[1] : d;
+                          return <option key={d} value={d}>{label}</option>;
+                        })}
+                      </select>
+                    </div>
+                  )}
+                  {cddsError && <div style={{ fontSize: 8, color: '#cc0000', marginBottom: 6, fontFamily: 'monospace' }}>{cddsError}</div>}
+                  <button onClick={cddsFetchTrace} disabled={!cddsDate || cddsFetching}
+                    style={{ width: '100%', padding: '5px 0', fontSize: 9, fontFamily: 'monospace', cursor: cddsDate && !cddsFetching ? 'pointer' : 'not-allowed', background: '#141414', color: '#E4E3E0', border: 'none', opacity: cddsDate && !cddsFetching ? 1 : 0.4 }}>
+                    {cddsFetching ? 'Fetching...' : 'Load Trace'}
+                  </button>
+                  {cddsLastCSV && (
+                    <button type="button" onClick={() => {
+                      const m = cddsDate.match(/(\d{4})-(\d{2})-(\d{2})/);
+                      const d = m ? m[3]+'-'+m[2]+'-'+m[1] : cddsDate.replace(/[^0-9]/g,'-').substring(0,10);
+                      const fname = 'CDDS_' + cddsELR + '_' + cddsTID + '_' + d + '.csv';
+                      const blob = new Blob([cddsLastCSV], { type: 'text/csv' });
+                      const a = document.createElement('a');
+                      a.href = URL.createObjectURL(blob);
+                      a.download = fname;
+                      a.click();
+                    }} style={{ width: '100%', marginTop: 4, padding: '4px 0', fontSize: 9, fontFamily: 'monospace', cursor: 'pointer', background: 'transparent', color: '#141414', border: '1px solid rgba(20,20,20,0.3)' }}>
+                      Download CSV
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <div style={{ border: '1px solid #141414', padding: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                  <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.15em', opacity: 0.5 }}>Input Files</div>
+                  <button onClick={() => setCddsOpen(o => !o)}
+                    style={{ fontSize: 8, fontFamily: 'monospace', background: cddsOpen ? '#141414' : 'transparent', color: cddsOpen ? '#E4E3E0' : 'inherit', border: '1px solid rgba(20,20,20,0.25)', padding: '2px 7px', cursor: 'pointer', borderRadius: 2 }}>
+                    Search
+                  </button>
+                </div>
+                {[
+                  { label: 'Raw Data CSV', state: rawFile, onChange: handleRawChange, accept: '.csv' },
+                  { label: 'Faults CSV',   state: faultsFile, onChange: (e) => {
+              if (e.target.files?.[0]) {
+                const f = e.target.files[0];
+                setFaultsFile(f);
+                f.text().then(t => {
+                  const all = parseFaultsCSV(t);
+                  // Filter to matching ELR + Track ID if trace is loaded
+                  if (traceData && traceData.meta) {
+                    const elr = traceData.meta.elr || '';
+                    const tid = traceData.meta.trackId || '';
+                    const filtered = all.filter(row =>
+                      (!elr || (row['ELR'] || '').trim().toUpperCase() === elr.toUpperCase()) &&
+                      (!tid  || (row['Track ID'] || '').toString().trim() === tid.toString().trim())
+                    );
+                    console.log('Faults loaded:', all.length, '-> filtered:', filtered.length, 'for ELR:', elr, 'Track:', tid);
+                  if (filtered.length === 0 && all.length > 0) {
+                    console.log('First fault row keys:', Object.keys(all[0]));
+                    console.log('First fault row sample:', JSON.stringify(all[0]));
+                  }
+                    setFaultsData(filtered);
+                  } else {
+                    console.log('Faults loaded:', all.length, '(no trace loaded, keeping all)');
+                    setFaultsData(all);
+                  }
+                });
+              }
+            }, accept: '.csv' },
+                  { label: 'Quality CSV',  state: qualityFile, onChange: (e) => {
+              if (e.target.files?.[0]) {
+                const f = e.target.files[0];
+                setQualityFile(f);
+                f.text().then(t => {
+                  const all = parseFaultsCSV(t);
+                  if (traceData && traceData.meta) {
+                    const elr = traceData.meta.elr || '';
+                    const tid = traceData.meta.trackId || '';
+                    const filtered = all.filter(row =>
+                      (!elr || (row['ELR'] || '').trim().toUpperCase() === elr.toUpperCase()) &&
+                      (!tid  || (row['Track ID'] || '').toString().trim() === tid.toString().trim())
+                    );
+                    console.log('Quality loaded:', all.length, '-> filtered:', filtered.length);
+                    setQualityData(filtered);
+                  } else {
+                    setQualityData(all);
+                  }
+                });
+              }
+            }, accept: '.csv' },
+                ].map(({ label, state, onChange, accept }) => (
+                  <label key={label} style={{ display: 'block', marginBottom: 8, cursor: 'pointer' }}>
+                    <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 2 }}>{label}</div>
+                    <div style={{
+                      border: '1px solid #141414', padding: '4px 8px', fontSize: 10, fontFamily: 'monospace',
+                      background: state ? '#141414' : 'transparent', color: state ? '#E4E3E0' : '#141414',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                    }}>
+                      {state ? state.name : 'Select file…'}
+                    </div>
+                    <input type="file" accept={accept} onChange={onChange} style={{ display: 'none' }} />
+                  </label>
+                ))}
+
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 2 }}>Output Filename</div>
+                  <input
+                    type="text" value={filename} onChange={e => setFilename(e.target.value)}
+                    placeholder="annotated_trace"
+                    style={{ width: '100%', border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '4px 6px', fontSize: 10, fontFamily: 'monospace', boxSizing: 'border-box' }}
+                  />
+                </div>
+
+                <button
+                  onClick={handleProcess}
+                  disabled={!rawFile || !faultsFile || !qualityFile || status === 'processing'}
+                  style={{
+                    marginTop: 10, width: '100%', padding: '6px 0',
+                    border: '1px solid #141414', background: 'transparent',
+                    fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.15em',
+                    cursor: (!rawFile || !faultsFile || !qualityFile || status === 'processing') ? 'not-allowed' : 'pointer',
+                    opacity: (!rawFile || !faultsFile || !qualityFile || status === 'processing') ? 0.4 : 1,
+                  }}
+                >
+                  {status === 'processing' ? 'Processing…' : 'Export PDF'}
+                </button>
+                {error && <div style={{ fontSize: 9, color: '#c00', marginTop: 6, fontFamily: 'monospace' }}>{error}</div>}
+              </div>
+              <div style={{ border: '1px solid rgba(20,20,20,0.2)', padding: 10 }}>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 8 }}>Zoom</div>
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <button onClick={() => setPixelsPerYard(p => Math.max(0.02, p * 0.7))}
+                    style={{ flex: 1, border: '1px solid #141414', background: 'transparent', padding: '4px 0', fontSize: 11, cursor: 'pointer' }}>−</button>
+                  <span style={{ fontSize: 9, fontFamily: 'monospace', opacity: 0.6, flex: 1, textAlign: 'center' }}>{(pixelsPerYard * 1760).toFixed(0)}px/mi</span>
+                  <button onClick={() => setPixelsPerYard(p => Math.min(5, p * 1.4))}
+                    style={{ flex: 1, border: '1px solid #141414', background: 'transparent', padding: '4px 0', fontSize: 11, cursor: 'pointer' }}>+</button>
+                </div>
+                <div style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.4, marginTop: 4 }}>Ctrl+scroll to zoom</div>
+              </div>
+              <div style={{ border: '1px solid rgba(20,20,20,0.2)', padding: 10 }}>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 8 }}>Channels (zoom = divisions visible)</div>
+                {CHANNELS.map(ch => (
+                  <div key={ch.key} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 4 }}>
+                    <button type="button" onClick={() => toggleChannelVisibility(ch.key)}
+                      style={{ display: 'flex', alignItems: 'center', flexShrink: 0, background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}>
+                      <span style={{
+                        display: 'inline-flex', width: 28, height: 16, borderRadius: 8, flexShrink: 0,
+                        background: channelVisibility[ch.key] ? '#141414' : 'rgba(20,20,20,0.2)',
+                        position: 'relative', transition: 'background 0.2s',
+                      }}>
+                        <span style={{
+                          position: 'absolute', top: 2, left: channelVisibility[ch.key] ? 14 : 2,
+                          width: 12, height: 12, borderRadius: 6, background: 'white', transition: 'left 0.2s',
+                        }} />
+                      </span>
+                    </button>
+                    <span style={{ fontSize: 9, fontFamily: 'monospace', opacity: 0.7, flex: 1 }}>{ch.label}</span>
+                    <input
+                      type="number" value={channelScales[ch.key]} min="0.1" step="1"
+                      onChange={e => handleScaleChange(ch.key, e.target.value)}
+                      style={{ width: 40, border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '1px 3px', fontSize: 9, fontFamily: 'monospace', textAlign: 'right' }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ border: '1px solid rgba(20,20,20,0.2)', padding: 10 }}>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 8 }}>Savgol Filter</div>
+                {SAVGOL_CHANNELS.map(key => (
+                  <div key={key} style={{ marginBottom: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                      <button type="button" onClick={() => setSavgolEnabled(prev => ({...prev, [key]: !prev[key]}))}
+                        style={{ display: 'flex', alignItems: 'center', background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}>
+                        <span style={{
+                          display: 'inline-flex', width: 28, height: 16, borderRadius: 8,
+                          background: savgolEnabled[key] ? '#141414' : 'rgba(20,20,20,0.2)',
+                          position: 'relative', transition: 'background 0.2s',
+                        }}>
+                          <span style={{
+                            position: 'absolute', top: 2, left: savgolEnabled[key] ? 14 : 2,
+                            width: 12, height: 12, borderRadius: 6, background: 'white', transition: 'left 0.2s',
+                          }} />
+                        </span>
+                      </button>
+                      <span style={{ fontSize: 9, fontFamily: 'monospace', opacity: 0.8 }}>{key}</span>
+                    </div>
+                    {savgolEnabled[key] && (
+                      <div style={{ paddingLeft: 34 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 3 }}>
+                          <span style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5 }}>window</span>
+                          <input type="number" min="5" step="2" value={savgolWindow[key]}
+                            onChange={e => { const v = parseInt(e.target.value); if (v >= 5) setSavgolWindow(prev => ({...prev, [key]: v})); }}
+                            style={{ width: 50, border: '1px solid rgba(20,20,20,0.3)', background: 'transparent', padding: '1px 3px', fontSize: 9, fontFamily: 'monospace' }}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <button type="button" onClick={() => setSavgolShowRaw(prev => ({...prev, [key]: !prev[key]}))}
+                            style={{ display: 'flex', alignItems: 'center', background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}>
+                            <span style={{
+                              display: 'inline-flex', width: 22, height: 13, borderRadius: 6,
+                              background: savgolShowRaw[key] ? '#141414' : 'rgba(20,20,20,0.2)',
+                              position: 'relative', transition: 'background 0.2s', flexShrink: 0,
+                            }}>
+                              <span style={{
+                                position: 'absolute', top: 1.5, left: savgolShowRaw[key] ? 11 : 1.5,
+                                width: 10, height: 10, borderRadius: 5, background: 'white', transition: 'left 0.2s',
+                              }} />
+                            </span>
+                          </button>
+                          <span style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.5 }}>show raw</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ border: '1px solid rgba(20,20,20,0.2)', padding: 10 }}>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 8 }}>Annotation Layers</div>
+                {[
+                  { key: 'faults',       label: 'Current Faults'  },
+                  { key: 'quality',      label: 'Track Quality'    },
+                  { key: 'sc',           label: 'S&C Locations'    },
+                  { key: 'otm',          label: 'OTM Plan'         },
+                  { key: 'underbridges', label: 'Underbridges'     },
+                  { key: 'overbridges',  label: 'Overbridges'      },
+                  { key: 'culverts',     label: 'Culverts'         },
+                  { key: 'trackcat',     label: 'Track Cat'        },
+                ].map(({ key, label }) => (
+                  <button key={key} type="button" onClick={() => toggleItem(key)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 0', color: '#141414' }}
+                  >
+                    <span style={{
+                      display: 'inline-flex', flexShrink: 0, width: 32, height: 18, borderRadius: 9,
+                      background: toggles[key] ? '#141414' : 'rgba(20,20,20,0.2)', position: 'relative', transition: 'background 0.2s',
+                    }}>
+                      <span style={{
+                        position: 'absolute', top: 2, left: toggles[key] ? 16 : 2,
+                        width: 14, height: 14, borderRadius: 7, background: 'white', transition: 'left 0.2s',
+                      }} />
+                    </span>
+                    <span style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{label}</span>
+                  </button>
+                ))}
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(20,20,20,0.1)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                    <span style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, letterSpacing: '0.1em' }}>OTM Range</span>
+                    <span style={{ fontSize: 9, fontFamily: 'monospace', fontWeight: 'bold' }}>±{otmWeeks}w</span>
+                  </div>
+                  <input type="range" min={1} max={52} value={otmWeeks}
+                    onChange={e => setOtmWeeks(parseInt(e.target.value))}
+                    style={{ width: '100%', accentColor: '#141414', cursor: 'pointer' }}
+                  />
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.4 }}>1w</span>
+                    <span style={{ fontSize: 8, fontFamily: 'monospace', opacity: 0.4 }}>52w</span>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ padding: '16px 0', borderBottom: '1px solid rgba(20,20,20,0.1)' }}>
+                <div style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', opacity: 0.5, marginBottom: 8 }}>Fault Limits</div>
+                {[
+                  { key: 'twist',      label: 'Twist (3m)'  },
+                  { key: 'tightGauge', label: 'Tight Gauge' },
+                  { key: 'wideGauge',  label: 'Wide Gauge'  },
+                  { key: 'top',        label: 'Top'         },
+                  { key: 'line',       label: 'Line'        }
+                ].map(({ key, label }) => {
+                  const isOpen = faultDropdownsOpen[key];
+                  const masterOn = faultLimitToggles[key].master;
+                  return (
+                    <div key={key} style={{ marginBottom: 4 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                        <button type="button" onClick={() => setFaultDropdownsOpen(p => ({ ...p, [key]: !p[key] }))}
+                          style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 4px', fontSize: 10, color: '#141414', fontFamily: 'monospace', lineHeight: 1 }}>
+                          {isOpen ? '▼' : '▶'}
+                        </button>
+                        <button type="button" onClick={() => toggleFaultMaster(key)}
+                          style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, background: 'transparent', border: 'none', cursor: 'pointer', padding: '3px 0', color: '#141414' }}>
+                          <span style={{
+                            display: 'inline-flex', flexShrink: 0, width: 32, height: 18, borderRadius: 9,
+                            background: masterOn ? '#141414' : 'rgba(20,20,20,0.2)', position: 'relative', transition: 'background 0.2s',
+                          }}>
+                            <span style={{
+                              position: 'absolute', top: 2, left: masterOn ? 16 : 2,
+                              width: 14, height: 14, borderRadius: 7, background: 'white', transition: 'left 0.2s',
+                            }} />
+                          </span>
+                          <span style={{ fontSize: 9, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>{label}</span>
+                        </button>
+                      </div>
+                      {isOpen && (
+                        <div style={{ paddingLeft: 16, marginTop: 4 }}>
+                          {FAULT_LIMITS[key].groups.map(g => {
+                            const on = faultLimitToggles[key][g.id];
+                            const dotColor = g.kind === 'IAL' ? '#ff3333' : '#ff9900';
+                            return (
+                              <button key={g.id} type="button" onClick={() => toggleFaultGroup(key, g.id)}
+                                style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', background: 'transparent', border: 'none', cursor: 'pointer', padding: '2px 0', color: '#141414' }}>
+                                <span style={{
+                                  display: 'inline-block', width: 10, height: 10, borderRadius: 2,
+                                  background: on ? dotColor : 'transparent',
+                                  border: '1px solid ' + dotColor
+                                }} />
+                                <span style={{ fontSize: 8, fontFamily: 'monospace', letterSpacing: '0.05em', opacity: on ? 1 : 0.6 }}>{g.label}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }} ref={containerRef}>
+              {!traceData ? (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.4 }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 32, marginBottom: 8 }}>📈</div>
+                    <div style={{ fontSize: 11, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Load a raw data CSV to begin</div>
+                  </div>
+                </div>
+              ) : (
+                <React.Fragment>
+                <div style={{ position: 'sticky', top: 0, zIndex: 30, background: '#E4E3E0', borderBottom: '1px solid rgba(20,20,20,0.2)', display: 'flex' }}>
+                  <div style={{ width: LABEL_WIDTH, flexShrink: 0, background: '#E4E3E0', borderRight: '1px solid rgba(20,20,20,0.2)' }} />
+                  <div style={{ flex: 1, overflow: 'hidden' }}>
+                    <MileageRuler
+                      points={traceData.points}
+                      pixelsPerYard={pixelsPerYard}
+                      scrollLeft={scrollLeft}
+                      viewWidth={viewWidth}
+                    />
+                  </div>
+                </div>
+                <div
+                ref={scrollRef}
+                onScroll={(e) => setScrollLeft(e.target.scrollLeft)}
+                onWheel={handleWheel}
+                onMouseMove={handleMouseMove}
+                onMouseLeave={handleMouseLeave}
+                style={{ overflowX: 'scroll', overflowY: 'visible' }}
+              >
+                <div style={{ width: rawTraceWidth + LABEL_WIDTH, minWidth: '100%' }}>
+                  {CHANNELS.filter(ch => channelVisibility[ch.key]).map(ch => (
+                    <div key={ch.key}>
+                      <div style={{ display: 'flex', alignItems: 'stretch' }}>
+                        <div style={{
+                          width: LABEL_WIDTH, flexShrink: 0,
+                          position: 'sticky', left: 0, zIndex: 10,
+                          borderRight: '1px solid rgba(20,20,20,0.2)',
+                          display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                          padding: '2px 8px', background: '#E4E3E0', height: channelHeights[ch.key]
+                        }}>
+                          <div style={{ fontSize: 9, fontWeight: 'bold', fontFamily: 'monospace' }}>{ch.label}</div>
+                          <div style={{ fontSize: 8, opacity: 0.5, fontFamily: 'monospace' }}>±{ch.divSize}mm/div</div>
+                        </div>
+                        <div style={{ position: 'sticky', left: LABEL_WIDTH, zIndex: 5 }}>
+                          <ChannelCanvas
+                            channel={ch}
+                            points={traceData.points}
+                            height={channelHeights[ch.key]}
+                            pixelsPerYard={pixelsPerYard}
+                            scrollLeft={scrollLeft}
+                            viewWidth={viewWidth}
+                            scale={channelScales[ch.key]}
+                            divSize={ch.divSize}
+                            savgolData={savgolDataMap[ch.key] || null}
+                            savgolShowRaw={savgolShowRaw[ch.key] !== false}
+                            activeLimits={activeLimitsForChannel(ch.key)}
+                            trackCat={assetsData.trackCat || []}
+                            faults={[
+                              ...(toggles.faults  ? faultsData.map(f => ({...f, _type:'fault'}))   : []),
+                              ...(toggles.quality ? qualityData.map(f => ({...f, _type:'quality'})) : []),
+                            ]}
+                          />
+                        </div>
+                      </div>
+                      <div
+                        className="resize-handle"
+                        onMouseDown={(e) => startResize(ch.key, e)}
+                        title="Drag to resize channel"
+                      />
+                    </div>
+                  ))}
+
+                  {traceData.points.length > 0 && ANNOTATION_CHANNELS.filter(ach => {
+                    const anyOn = ach.key === 'structures'
+                      ? (toggles.underbridges || toggles.overbridges || toggles.culverts)
+                      : toggles[ach.key];
+                    return anyOn;
+                  }).map(ach => {
+                    const surveyDate = traceData.meta && traceData.meta.date
+                      ? (() => { const p = traceData.meta.date.split('/'); return new Date(p[2]+'-'+p[1]+'-'+p[0]); })()
+                      : null;
+                    // Filter structures by toggle
+                    const filteredAssets = ach.key === 'structures' ? {
+                      ...assetsData,
+                      structures: (assetsData.structures || []).filter(s => {
+                        const isUB = s.assetType === 'Underbridge';
+                        const isOB = s.assetType === 'Overbridge' || s.assetType === 'Footbridge';
+                        const isUC = s.assetType === 'Underline Culvert';
+                        return (isUB && toggles.underbridges) || (isOB && toggles.overbridges) || (isUC && toggles.culverts);
+                      })
+                    } : assetsData;
+                    return (
+                      <div key={ach.key} style={{ minWidth: rawTraceWidth + LABEL_WIDTH }}>
+                        <div style={{ display: 'flex', alignItems: 'stretch' }}>
+                          <div style={{
+                            width: LABEL_WIDTH, flexShrink: 0,
+                            position: 'sticky', left: 0, zIndex: 10,
+                            borderRight: '1px solid rgba(20,20,20,0.2)',
+                            borderTop: '2px solid ' + ach.color,
+                            display: 'flex', flexDirection: 'column', justifyContent: 'center',
+                            padding: '2px 8px', background: '#E4E3E0', height: ach.height
+                          }}>
+                            <div style={{ fontSize: 9, fontWeight: 'bold', fontFamily: 'monospace', color: ach.color }}>{ach.label}</div>
+                          </div>
+                          <div style={{ position: 'sticky', left: LABEL_WIDTH, zIndex: 5, borderTop: '2px solid ' + ach.color, overflow: 'hidden' }}>
+                            <AnnotationCanvas
+                              channelKey={ach.key}
+                              assets={filteredAssets}
+                              height={ach.height}
+                              pixelsPerYard={pixelsPerYard}
+                              scrollLeft={scrollLeft}
+                              viewWidth={viewWidth}
+                              traceMinAbs={traceData.points[0].absYards}
+                              surveyDate={surveyDate}
+                              otmWeeks={otmWeeks}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+                </React.Fragment>
+              )}
+            </div>
+          </div>
+        <HoverTooltip info={hoverInfo} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
