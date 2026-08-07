@@ -5,9 +5,9 @@ import { parse } from "csv-parse/sync";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 
-const APP_ROOT = existsSync(join(__dirname, "index.html"))
-  ? __dirname
-  : join(__dirname, "..");
+const APP_ROOT = existsSync(join(__dirname, "..", "index.html"))
+  ? join(__dirname, "..")
+  : __dirname;
 
 interface SCRecord {
   elr: string;
