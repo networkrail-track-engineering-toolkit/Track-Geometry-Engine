@@ -1421,7 +1421,15 @@
         formData.append('channelScales', JSON.stringify(channelScales));
         try {
           const res = await fetch('/api/process', { method: 'POST', body: formData });
-          if (!res.ok) { const d = await res.json(); throw new Error(d.error || 'Failed'); }
+          if (!res.ok) {
+            const contentType = res.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              const d = await res.json();
+              throw new Error(d.error || 'Failed');
+            }
+            const text = await res.text();
+            throw new Error(text || 'Failed');
+          }
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');

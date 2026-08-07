@@ -314,7 +314,9 @@ app.post("/api/process", upload.fields([
     try {
       const parsed = JSON.parse(req.body.channelScales || '{}');
       Object.assign(userScales, parsed);
-    } catch {}
+    } catch (error) {
+      return res.status(400).json({ error: "Invalid channel scale settings" });
+    }
 
     const parseCSV = (buffer: Buffer) => {
       const content = buffer.toString('utf-8');
