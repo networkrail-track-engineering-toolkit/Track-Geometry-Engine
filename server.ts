@@ -2,8 +2,12 @@ import express from "express";
 import multer from "multer";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import { parse } from "csv-parse/sync";
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+
+const APP_ROOT = existsSync(join(__dirname, "index.html"))
+  ? __dirname
+  : join(__dirname, "..");
 
 interface SCRecord {
   elr: string;
@@ -17,7 +21,7 @@ interface SCRecord {
 }
 
 const SC_DATA: SCRecord[] = JSON.parse(
-  readFileSync(join(__dirname, "scData.json"), "utf-8")
+  readFileSync(join(APP_ROOT, "scData.json"), "utf-8")
 );
 
 interface OTMRecord {
@@ -34,7 +38,7 @@ interface OTMRecord {
 }
 
 const OTM_DATA: OTMRecord[] = JSON.parse(
-  readFileSync(join(__dirname, "otmData.json"), "utf-8")
+  readFileSync(join(APP_ROOT, "otmData.json"), "utf-8")
 );
 
 interface StructureRecord {
@@ -50,7 +54,7 @@ interface StructureRecord {
 }
 
 const STRUCTURES_DATA: StructureRecord[] = JSON.parse(
-  readFileSync(join(__dirname, "structuresData.json"), "utf-8")
+  readFileSync(join(APP_ROOT, "structuresData.json"), "utf-8")
 );
 
 interface TrackCatRecord {
@@ -65,7 +69,7 @@ interface TrackCatRecord {
 }
 
 const TRACKCAT_DATA: TrackCatRecord[] = JSON.parse(
-  readFileSync(join(__dirname, "trackCatData.json"), "utf-8")
+  readFileSync(join(APP_ROOT, "trackCatData.json"), "utf-8")
 );
 
 const app = express();
@@ -73,6 +77,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static(APP_ROOT));
 
 
 /* ============================================================
@@ -1341,11 +1346,11 @@ app.get("/api/assets", (req: any, res) => {
 });
 
 app.get("/", (_req, res) => {
-  res.sendFile(join(__dirname, "index.html"));
+  res.sendFile(join(APP_ROOT, "index.html"));
 });
 
 app.get("/export-tool", (_req, res) => {
-  res.sendFile(join(__dirname, "cdds_export.html"));
+  res.sendFile(join(APP_ROOT, "cdds_export.html"));
 });
 
 app.listen(PORT, "0.0.0.0", () => {
