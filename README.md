@@ -113,6 +113,40 @@ You can start the app in two ways:
 
 ---
 
+## Running on Azure
+
+This repo is now set up to run on **Azure App Service** as a Node.js app.
+
+### What Azure needs
+
+1. Create an **Azure Web App** for Node.js on Linux
+2. Set the startup command to:
+   ```
+   npm start
+   ```
+3. Add the GitHub repository publish profile secret used by the workflow:
+   - `AZUREAPPSERVICE_PUBLISHPROFILE_3F2E74FECAF741EDBAF59F8CC2311645`
+4. Ensure the app setting `WEBSITE_NODE_DEFAULT_VERSION` is set to **20-lts** or another Node 20 runtime
+
+### How deployment works
+
+- `npm run build` compiles `server.ts` into `dist\server.js`
+- Azure starts the app with `npm start`
+- The Express server serves `index.html`, `cdds_export.html`, and the JSON asset files directly
+- The GitHub Actions workflow deploys the compiled server plus the required static/data files
+
+### Important limitation
+
+CDDS access will only work in Azure if the Azure-hosted app can reach the same internal Network Rail services your local machine can reach today. If CDDS is only available on the corporate network, you will need Azure network connectivity such as:
+
+- VPN or ExpressRoute into the corporate network
+- VNet integration plus routing to the internal CDDS endpoint
+- Firewall / DNS rules that allow the Web App to reach CDDS
+
+Without that network path, **local CSV upload and PDF export will work**, but **live CDDS fetches will fail**.
+
+---
+
 ## Using the App
 
 ### Loading a Trace

@@ -21,11 +21,12 @@ jobs:
       - name: Set up Node.js version
         uses: actions/setup-node@v3
         with:
-          node-version: '24.x'
+          node-version: '20.x'
+          cache: 'npm'
 
       - name: npm install, build, and test
         run: |
-          npm install
+          npm ci
           npm run build --if-present
           npm run test --if-present
 
@@ -33,7 +34,17 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          path: |
+            dist
+            index.html
+            cdds_export.html
+            scData.json
+            otmData.json
+            structuresData.json
+            trackCatData.json
+            drainageData.json
+            package.json
+            package-lock.json
 
   deploy:
     runs-on: ubuntu-latest
