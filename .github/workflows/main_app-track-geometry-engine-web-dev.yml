@@ -30,6 +30,7 @@ jobs:
           npm ci
           npm run build --if-present
           npm run test --if-present
+          npm prune --omit=dev
 
       # App Service runs "npm start" without installing anything, so the
       # deployment package must contain node_modules or the app fails to
