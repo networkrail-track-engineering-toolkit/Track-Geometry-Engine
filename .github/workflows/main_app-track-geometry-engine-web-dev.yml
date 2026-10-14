@@ -55,6 +55,10 @@ jobs:
           name: node-app
           path: release.zip
 
+      - name: Create startup manifest
+        run: |
+          printf "node dist/server.js" > startup.txt
+
   deploy:
     runs-on: ubuntu-latest
     needs: build
