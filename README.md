@@ -1,6 +1,6 @@
 # Track Geometry Engine
 
-A railway track geometry viewer and annotation tool. Load raw CSV traces from file or directly from CDDS, view all geometry channels interactively, and export annotated PDFs with fault and quality overlays.
+A railway track geometry viewer and annotation tool. Load raw traces from a local CSV or ASCII TXT file, or directly from CDDS, view all geometry channels interactively, and export annotated PDFs with fault and quality overlays.
 
 ---
 
@@ -42,7 +42,7 @@ Different actions require different network connections:
 | Installing node modules (`npm install`) | **102 WiFi** |
 | Running the app (`npm run dev`) | Ethernet or **14 WiFi** |
 | Loading a CDDS trace | Ethernet or **14 WiFi** (needs corporate network access) |
-| Loading a local CSV file | Any connection (or none) |
+| Loading a local raw data file (CSV or TXT) | Any connection (or none) |
 
 If `npm install` fails or hangs, check you are connected to **102 WiFi** first.
 After installation is complete, switch back to **Ethernet or 14 WiFi** before starting the server.
@@ -153,8 +153,8 @@ Without that network path, **local CSV upload and PDF export will work**, but **
 
 You can load a trace in two ways:
 
-**From a local CSV file**
-1. Click **Select file** next to Raw Data CSV
+**From a local raw data file (`.csv` or `.txt`)**
+1. Click **Select file** next to Raw Data CSV / TXT — both the CDDS CSV export and the ASCII raw data `.txt` export (e.g. `ASCII_ECM1_2100_100-0-120-0_31-08-2026.txt`) are accepted
 2. Optionally load a Faults CSV and Quality CSV
 3. The trace will load automatically
 
