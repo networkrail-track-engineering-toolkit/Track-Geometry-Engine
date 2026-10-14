@@ -253,10 +253,11 @@
     const MIN_CHANNEL_HEIGHT = 30;
     const DEFAULT_CHANNEL_HEIGHT = 80;
 
-    // ─── Parse raw CSV ─────────────────────────────────────────────────────────
+    // ─── Parse raw trace file (tab separated CSV or ASCII .txt export) ─────────
     function parseRawCSV(text) {
       const lines = text.split(/\r?\n/);
-      const header = lines[0];
+      const headerIdx = lines.findIndex(l => /ELR:/.test(l));
+      const header = headerIdx === -1 ? (lines[0] || '') : lines[headerIdx];
       const meta = {};
       const elrM = header.match(/ELR:\s*(\S+)/); if (elrM) meta.elr = elrM[1];
       const tidM = header.match(/Track Id:\s*(\d+)/); if (tidM) meta.trackId = tidM[1];
@@ -264,7 +265,11 @@
       const startM = header.match(/Start Eighth:\s*(\S+)/); if (startM) meta.startEighth = startM[1];
       const endM = header.match(/End Eighth:\s*(\S+)/); if (endM) meta.endEighth = endM[1];
 
-      const dataLines = lines.slice(4).filter(l => l.trim());
+      // Data starts after the units row ("mile  yards  chs  …"); fall back to the
+      // fixed 4-line header used by the CDDS export if that row is missing.
+      const unitsIdx = lines.findIndex(l => /^mile\s*\t/i.test(l));
+      const dataStart = unitsIdx === -1 ? 4 : unitsIdx + 1;
+      const dataLines = lines.slice(dataStart).filter(l => l.trim());
       const points = [];
       for (const line of dataLines) {
         const cols = line.split('\t');
@@ -1538,7 +1543,7 @@
                   </button>
                 </div>
                 {[
-                  { label: 'Raw Data CSV', state: rawFile, onChange: handleRawChange, accept: '.csv' },
+                  { label: 'Raw Data CSV / TXT', state: rawFile, onChange: handleRawChange, accept: '.csv,.txt' },
                   { label: 'Faults CSV',   state: faultsFile, onChange: (e) => {
               if (e.target.files?.[0]) {
                 const f = e.target.files[0];

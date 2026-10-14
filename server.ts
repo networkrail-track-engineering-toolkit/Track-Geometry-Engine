@@ -333,10 +333,13 @@ app.post("/api/process", upload.fields([
       });
     };
 
-    // Extract ELR and Track ID from the raw CSV header line FIRST
+    // Extract ELR and Track ID from the raw trace header line FIRST
     // e.g. "ELR: DOW    Track Id: 1100    ..."
+    // Accepts both the CDDS CSV export and the ASCII .txt raw data export.
     const rawContent = rawFile.buffer.toString('utf-8');
-    const rawHeader  = rawContent.split(/\r?\n/)[0];
+    const rawLinesAll = rawContent.split(/\r?\n/);
+    const rawHeaderIdx = rawLinesAll.findIndex(l => /ELR:/.test(l));
+    const rawHeader  = rawHeaderIdx === -1 ? (rawLinesAll[0] || '') : rawLinesAll[rawHeaderIdx];
     const elrMatch   = rawHeader.match(/ELR:\s*(\S+)/);
     const tidMatch   = rawHeader.match(/Track Id:\s*(\d+)/);
     const traceELR     = elrMatch ? elrMatch[1].trim().toUpperCase() : '';
@@ -447,12 +450,19 @@ app.post("/api/process", upload.fields([
       CantDef:    [0, 0.204, 1],
     };
 
-    const rawLines = rawContent.split(/\r?\n/);
+    const rawLines = rawLinesAll;
     const rawPoints: RawPoint[] = [];
 
-    for (let li = 4; li < rawLines.length; li++) {
-      const line = rawLines[li].trim();
-      if (!line) continue;
+    // Data starts after the units row ("mile  yards  chs  …"); fall back to the
+    // fixed 4-line header used by the CDDS export if that row is missing.
+    const rawUnitsIdx  = rawLines.findIndex(l => /^mile\s*\t/i.test(l));
+    const rawDataStart = rawUnitsIdx === -1 ? 4 : rawUnitsIdx + 1;
+
+    for (let li = rawDataStart; li < rawLines.length; li++) {
+      // Do not trim the line — trailing channels are often blank and trimming
+      // would drop the empty columns, losing otherwise valid data rows.
+      const line = rawLines[li];
+      if (!line.trim()) continue;
       const cols = line.split('	');
       if (cols.length < 16) continue;
       const mile  = parseFloat(cols[0]);
