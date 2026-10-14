@@ -1546,7 +1546,7 @@
                   </button>
                 </div>
                 {[
-                  { label: 'Raw Data CSV', state: rawFile, onChange: handleRawChange, accept: '.csv' },
+                  { label: 'Raw Data (CSV/TXT)', state: rawFile, onChange: handleRawChange, accept: '.csv,.txt' },
                   { label: 'Faults CSV',   state: faultsFile, onChange: (e) => {
               if (e.target.files?.[0]) {
                 const f = e.target.files[0];
@@ -1825,7 +1825,7 @@
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.4 }}>
                   <div style={{ textAlign: 'center' }}>
                     <div style={{ fontSize: 32, marginBottom: 8 }}>📈</div>
-                    <div style={{ fontSize: 11, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Load a raw data CSV to begin</div>
+                    <div style={{ fontSize: 11, fontFamily: 'monospace', textTransform: 'uppercase', letterSpacing: '0.1em' }}>Load a raw data CSV or TXT file to begin</div>
                   </div>
                 </div>
               ) : (
